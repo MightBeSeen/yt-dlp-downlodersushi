@@ -1,0 +1,38 @@
+# Personal downloads and runtime data
+/Downloads/
+/7-3-26/
+/New folder/
+/logs/
+cookies*.txt
+*.part
+*.ytdl
+*.aria2
+
+# Downloaded media and sidecar files
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.avi
+*.flv
+*.mp3
+*.m4a
+*.aac
+*.wav
+*.opus
+*.ogg
+*.flac
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.vtt
+*.srt
+*.ass
+*.lrc
+*.description
+*.info.json
+
+# Local shortcuts and test files
+*.lnk
+/.test-temp/
