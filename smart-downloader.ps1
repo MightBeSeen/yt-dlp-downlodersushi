@@ -113,7 +113,7 @@ function Get-NewOrChangedFiles {
 
 function Show-FileList {
     param(
-        [Parameter(Mandatory = $true)][object[]]$Files,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Files,
         [switch]$IncludeTotal
     )
 
@@ -413,7 +413,7 @@ function New-HistoryRow {
 
 function Resolve-CompletedFiles {
     param(
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$ReportedPaths,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$ReportedPaths,
         [Parameter(Mandatory = $true)][string]$TargetFolder,
         [Parameter(Mandatory = $true)][hashtable]$Before
     )
@@ -487,7 +487,10 @@ function Start-SmartDownload {
     }
     $before = Get-FileSnapshot -Path $targetFolder
 
-    $arguments = @('-t', $preset, '-P', $targetFolder)
+    # --print enables yt-dlp's quiet mode implicitly, so restore progress explicitly.
+    # The output is consumed by a line-oriented PowerShell pipeline; --newline makes
+    # percentage, speed, downloaded size, and ETA updates visible as they arrive.
+    $arguments = @('-t', $preset, '-P', $targetFolder, '--progress', '--newline')
     if ($liveDecision.Enabled) {
         $arguments += '--live-from-start'
     }
@@ -505,13 +508,28 @@ function Start-SmartDownload {
     $reportedPaths = New-Object System.Collections.Generic.List[string]
     $interrupted = $false
     $exitCode = 1
+    $progressLineActive = $false
+    $progressLineWidth = 0
     try {
         & $script:YtDlp @arguments 2>&1 | ForEach-Object {
             $line = [string]$_
+            if ($line -match '^\[download\]\s+\d+(?:\.\d+)?%') {
+                $progressLineWidth = [Math]::Max($progressLineWidth, $line.Length)
+                $padding = ' ' * ($progressLineWidth - $line.Length)
+                [Console]::Write(("`r{0}{1}" -f $line, $padding))
+                $progressLineActive = $true
+            } else {
+                if ($progressLineActive) {
+                    [Console]::WriteLine()
+                    $progressLineActive = $false
+                    $progressLineWidth = 0
+                }
+            }
+
             if ($line.StartsWith($script:OutputMarker, [System.StringComparison]::Ordinal)) {
                 $reportedPaths.Add($line.Substring($script:OutputMarker.Length))
                 Write-Host ('Saved: {0}' -f $line.Substring($script:OutputMarker.Length)) -ForegroundColor Green
-            } else {
+            } elseif ($line -notmatch '^\[download\]\s+\d+(?:\.\d+)?%') {
                 Write-Host $line
             }
         }
@@ -522,6 +540,10 @@ function Start-SmartDownload {
     } catch {
         Write-Host $_.Exception.Message -ForegroundColor Red
         $exitCode = 1
+    } finally {
+        if ($progressLineActive) {
+            [Console]::WriteLine()
+        }
     }
 
     $completedFiles = @(Resolve-CompletedFiles -ReportedPaths $reportedPaths -TargetFolder $targetFolder -Before $before)
@@ -544,7 +566,7 @@ function Start-SmartDownload {
     }
 
     try {
-        Add-HistoryRows -Rows @($historyRows)
+        Add-HistoryRows -Rows $historyRows.ToArray()
     } catch {
         Write-Host ('Could not update download history: {0}' -f $_.Exception.Message) -ForegroundColor Red
     }
@@ -613,7 +635,11 @@ function Show-DownloadHistory {
 }
 
 function Show-MainMenu {
-    Clear-Host
+    try {
+        Clear-Host
+    } catch {
+        # Redirected/non-interactive consoles may not expose a valid cursor handle.
+    }
     Write-Host '=============================================' -ForegroundColor Cyan
     Write-Host "          SEEN'S yt-dlp DOWNLOADER" -ForegroundColor White
     Write-Host '=============================================' -ForegroundColor Cyan
