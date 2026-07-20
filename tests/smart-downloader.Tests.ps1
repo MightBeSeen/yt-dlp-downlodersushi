@@ -94,6 +94,100 @@ $startupExitCode = $LASTEXITCODE
 Assert-True -Condition ($startupExitCode -eq 0) -Message 'redirected/non-interactive startup exits cleanly'
 Assert-True -Condition ($startupOutput -notmatch 'CursorPosition') -Message 'redirected startup does not fail while clearing the screen'
 
+$paginationHelpersAvailable = (
+    $null -ne (Get-Command Get-PageInfo -ErrorAction SilentlyContinue) -and
+    $null -ne (Get-Command ConvertTo-PageCommand -ErrorAction SilentlyContinue)
+)
+Assert-True -Condition $paginationHelpersAvailable -Message 'pagination helpers are available'
+
+if ($paginationHelpersAvailable) {
+    $emptyPage = Get-PageInfo -Items @() -PageIndex 0 -PageSize 5
+    Assert-True -Condition ($emptyPage.PageCount -eq 1 -and $emptyPage.Items.Count -eq 0) -Message 'empty pagination has one empty page'
+
+    $exactPage = Get-PageInfo -Items @(1, 2, 3, 4, 5) -PageIndex 0 -PageSize 5
+    Assert-True -Condition ($exactPage.PageCount -eq 1 -and $exactPage.Items.Count -eq 5) -Message 'five entries fit on one page'
+
+    $secondPage = Get-PageInfo -Items @(1, 2, 3, 4, 5, 6) -PageIndex 1 -PageSize 5
+    Assert-True -Condition ($secondPage.PageCount -eq 2 -and $secondPage.StartIndex -eq 5 -and $secondPage.Items[0] -eq 6) -Message 'six entries produce a one-item second page'
+
+    $clampedLastPage = Get-PageInfo -Items @(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11) -PageIndex 99 -PageSize 5
+    Assert-True -Condition ($clampedLastPage.PageIndex -eq 2 -and $clampedLastPage.PageCount -eq 3 -and $clampedLastPage.Items[0] -eq 11) -Message 'out-of-range pagination clamps to the final page'
+
+    $clampedFirstPage = Get-PageInfo -Items @(1, 2, 3, 4, 5, 6) -PageIndex -4 -PageSize 5
+    Assert-True -Condition ($clampedFirstPage.PageIndex -eq 0 -and $clampedFirstPage.Items[0] -eq 1) -Message 'negative pagination clamps to the first page'
+
+    Assert-True -Condition ((ConvertTo-PageCommand -InputValue 'LeftArrow') -eq 'Previous') -Message 'Left Arrow maps to the previous page'
+    Assert-True -Condition ((ConvertTo-PageCommand -InputValue 'P') -eq 'Previous') -Message 'P maps to the previous page'
+    Assert-True -Condition ((ConvertTo-PageCommand -InputValue 'RightArrow') -eq 'Next') -Message 'Right Arrow maps to the next page'
+    Assert-True -Condition ((ConvertTo-PageCommand -InputValue 'n') -eq 'Next') -Message 'N maps to the next page case-insensitively'
+    Assert-True -Condition ((ConvertTo-PageCommand -InputValue 'Enter') -eq 'Exit') -Message 'Enter exits pagination'
+    Assert-True -Condition ((ConvertTo-PageCommand -InputValue 'Escape') -eq 'Exit') -Message 'Escape exits pagination'
+    Assert-True -Condition ((ConvertTo-PageCommand -InputValue 'Q') -eq 'Exit') -Message 'Q exits pagination'
+
+    $fallbackCommand = Read-PageCommand
+    Assert-True -Condition ($fallbackCommand -eq 'Exit') -Message 'redirected input falls back to a blank-to-exit text command'
+}
+
+$fakeLibraryFiles = @(
+    1..6 | ForEach-Object {
+        [pscustomobject]@{
+            Length        = [long]($_ * 1000)
+            LastWriteTime = [datetime]'2026-07-20T12:00:00'
+            FullName      = Join-Path $testRoot ('library-{0}.mp4' -f $_)
+        }
+    }
+)
+function Get-MediaFiles { return @($fakeLibraryFiles) }
+function Clear-Terminal {
+    $script:clearTerminalCalls++
+}
+function Read-PageCommand {
+    if ($script:pageCommands.Count -eq 0) { return 'Exit' }
+    return $script:pageCommands.Dequeue()
+}
+
+$script:clearTerminalCalls = 0
+$script:pageCommands = New-Object System.Collections.Generic.Queue[string]
+$script:pageCommands.Enqueue('Previous')
+$script:pageCommands.Enqueue('Next')
+$script:pageCommands.Enqueue('Next')
+$script:pageCommands.Enqueue('Previous')
+$script:pageCommands.Enqueue('Exit')
+$libraryOutput = Show-LibraryReport *>&1 | Out-String
+$libraryRenders = @($libraryOutput -split 'Media library - biggest to smallest' | Where-Object { $_ -match 'Page \d+ of \d+' })
+Assert-True -Condition ($libraryOutput -match 'Page 1 of 2' -and $libraryOutput -match 'Page 2 of 2') -Message 'media library renders two five-item pages'
+Assert-True -Condition ($libraryRenders[0] -notmatch 'library-1\.mp4' -and $libraryRenders[1] -match 'library-1\.mp4') -Message 'media library limits the first page to five files'
+Assert-True -Condition ($script:clearTerminalCalls -eq 3) -Message 'page-boundary commands do not cause unnecessary redraws'
+Assert-True -Condition ($libraryOutput -match 'Total: 6 files') -Message 'media library keeps the full-list total on paged output'
+
+$historyRows = @(
+    1..6 | ForEach-Object {
+        [pscustomobject][ordered]@{
+            TimestampLocal = '2026-07-20T12:00:00+07:00'
+            Url            = 'https://example.test/history-{0}' -f $_
+            Preset         = 'mp4'
+            LiveMode       = 'Normal'
+            PlaylistMode   = 'Single'
+            Status         = 'Completed'
+            FilePath       = Join-Path $testRoot ('history-{0}.mp4' -f $_)
+            SizeBytes      = [long]($_ * 1000)
+        }
+    }
+)
+$script:HistoryPath = Join-Path $testRoot 'paged-history.csv'
+$historyRows | Export-Csv -LiteralPath $script:HistoryPath -NoTypeInformation -Encoding UTF8
+$script:clearTerminalCalls = 0
+$script:pageCommands = New-Object System.Collections.Generic.Queue[string]
+$script:pageCommands.Enqueue('Next')
+$script:pageCommands.Enqueue('Previous')
+$script:pageCommands.Enqueue('Exit')
+$historyOutput = Show-DownloadHistory *>&1 | Out-String
+$historyRenders = @($historyOutput -split 'Download history - biggest to smallest' | Where-Object { $_ -match 'Page \d+ of \d+' })
+Assert-True -Condition ($historyOutput -match 'Page 1 of 2' -and $historyOutput -match 'Page 2 of 2') -Message 'download history renders five records per page'
+Assert-True -Condition ($historyRenders[0] -notmatch 'history-1(?:\s|$)' -and $historyRenders[1] -match 'history-1(?:\s|$)') -Message 'download history limits the first page to five records'
+Assert-True -Condition ($script:clearTerminalCalls -eq 3) -Message 'history redraws when moving forward and backward'
+Assert-True -Condition ($historyOutput -match 'Recorded outputs: 6 files') -Message 'download history keeps the full-list total on every page'
+
 if ($failures.Count -gt 0) {
     Write-Host ''
     Write-Host ("{0} regression test(s) failed." -f $failures.Count) -ForegroundColor Red

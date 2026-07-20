@@ -39,6 +39,90 @@ function Pause-Terminal {
     [void](Read-Host 'Press Enter to return to the main menu')
 }
 
+function Clear-Terminal {
+    try {
+        Clear-Host
+    } catch {
+        # Redirected/non-interactive consoles may not expose a valid cursor handle.
+    }
+}
+
+function ConvertTo-PageCommand {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$InputValue)
+
+    switch ($InputValue.Trim().ToUpperInvariant()) {
+        'LEFTARROW'  { return 'Previous' }
+        'P'          { return 'Previous' }
+        'RIGHTARROW' { return 'Next' }
+        'N'          { return 'Next' }
+        'ENTER'      { return 'Exit' }
+        'ESCAPE'     { return 'Exit' }
+        'Q'          { return 'Exit' }
+        ''           { return 'Exit' }
+        default      { return 'Unknown' }
+    }
+}
+
+function Read-PageCommand {
+    while ($true) {
+        try {
+            $key = [Console]::ReadKey($true)
+            $command = ConvertTo-PageCommand -InputValue ([string]$key.Key)
+            if ($command -ne 'Unknown') {
+                return $command
+            }
+        } catch {
+            while ($true) {
+                $answer = Read-Host 'Page command: N next, P previous, Q back [Q]'
+                $command = ConvertTo-PageCommand -InputValue $answer
+                if ($command -ne 'Unknown') {
+                    return $command
+                }
+                Write-Host 'Use N, P, Q, or press Enter.' -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Get-PageInfo {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Items,
+        [Parameter(Mandatory = $true)][int]$PageIndex,
+        [int]$PageSize = 5
+    )
+
+    if ($PageSize -lt 1) {
+        throw 'Page size must be at least 1.'
+    }
+
+    $pageCount = [Math]::Max(1, [int][Math]::Ceiling($Items.Count / [double]$PageSize))
+    $clampedPageIndex = [Math]::Max(0, [Math]::Min($PageIndex, $pageCount - 1))
+    $startIndex = $clampedPageIndex * $PageSize
+    $pageItems = @()
+    if ($startIndex -lt $Items.Count) {
+        $endIndex = [Math]::Min($startIndex + $PageSize - 1, $Items.Count - 1)
+        $pageItems = @($Items[$startIndex..$endIndex])
+    }
+
+    return [pscustomobject]@{
+        PageIndex  = $clampedPageIndex
+        PageNumber = $clampedPageIndex + 1
+        PageCount  = $pageCount
+        StartIndex = $startIndex
+        Items      = @($pageItems)
+    }
+}
+
+function Write-PageFooter {
+    param(
+        [Parameter(Mandatory = $true)][int]$PageNumber,
+        [Parameter(Mandatory = $true)][int]$PageCount
+    )
+
+    Write-Host ''
+    Write-Host ('Page {0} of {1} | Left/P: Previous | Right/N: Next | Enter/Esc/Q: Back' -f $PageNumber, $PageCount) -ForegroundColor Cyan
+}
+
 function ConvertTo-HumanSize {
     param([Parameter(Mandatory = $true)][long]$Bytes)
 
@@ -111,6 +195,23 @@ function Get-NewOrChangedFiles {
     return @($changed)
 }
 
+function Write-FileRows {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Files,
+        [int]$StartIndex = 0
+    )
+
+    Write-Host ('{0,4}  {1,12}  {2,-19}  {3}' -f '#', 'Size', 'Downloaded/modified', 'File') -ForegroundColor DarkGray
+    $index = $StartIndex + 1
+    foreach ($file in $Files) {
+        $size = ConvertTo-HumanSize -Bytes ([long]$file.Length)
+        $when = $file.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+        $displayPath = Get-RelativeDisplayPath -Path $file.FullName
+        Write-Host ('{0,4}  {1,12}  {2,-19}  {3}' -f $index, $size, $when, $displayPath)
+        $index++
+    }
+}
+
 function Show-FileList {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Files,
@@ -123,15 +224,7 @@ function Show-FileList {
         return
     }
 
-    Write-Host ('{0,4}  {1,12}  {2,-19}  {3}' -f '#', 'Size', 'Downloaded/modified', 'File') -ForegroundColor DarkGray
-    $index = 1
-    foreach ($file in $sorted) {
-        $size = ConvertTo-HumanSize -Bytes ([long]$file.Length)
-        $when = $file.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
-        $displayPath = Get-RelativeDisplayPath -Path $file.FullName
-        Write-Host ('{0,4}  {1,12}  {2,-19}  {3}' -f $index, $size, $when, $displayPath)
-        $index++
-    }
+    Write-FileRows -Files $sorted
 
     if ($IncludeTotal) {
         $totalBytes = [long](($sorted | Measure-Object -Property Length -Sum).Sum)
@@ -584,17 +677,49 @@ function Start-SmartDownload {
 }
 
 function Show-LibraryReport {
-    Write-Heading -Text 'Media library - biggest to smallest'
-    Write-Host 'Temporary .part/.ytdl files, scripts, logs, cookies, and executables are excluded.' -ForegroundColor DarkGray
-    Write-Host ''
-    $files = @(Get-MediaFiles -Path $script:Root)
-    Show-FileList -Files $files -IncludeTotal
-    Pause-Terminal
+    $files = @(Get-MediaFiles -Path $script:Root | Sort-Object Length -Descending)
+    if ($files.Count -eq 0) {
+        Clear-Terminal
+        Write-Heading -Text 'Media library - biggest to smallest'
+        Write-Host 'Temporary .part/.ytdl files, scripts, logs, cookies, and executables are excluded.' -ForegroundColor DarkGray
+        Write-Host ''
+        Show-FileList -Files @()
+        Pause-Terminal
+        return
+    }
+
+    $totalBytes = [long](($files | Measure-Object -Property Length -Sum).Sum)
+    $pageIndex = 0
+    while ($true) {
+        $page = Get-PageInfo -Items $files -PageIndex $pageIndex -PageSize 5
+        Clear-Terminal
+        Write-Heading -Text 'Media library - biggest to smallest'
+        Write-Host 'Temporary .part/.ytdl files, scripts, logs, cookies, and executables are excluded.' -ForegroundColor DarkGray
+        Write-Host ''
+        Write-FileRows -Files $page.Items -StartIndex $page.StartIndex
+        Write-Host ''
+        Write-Host ('Total: {0} files, {1} ({2:N0} bytes)' -f $files.Count, (ConvertTo-HumanSize -Bytes $totalBytes), $totalBytes) -ForegroundColor Green
+        Write-PageFooter -PageNumber $page.PageNumber -PageCount $page.PageCount
+
+        while ($true) {
+            $command = Read-PageCommand
+            if ($command -eq 'Exit') { return }
+            if ($command -eq 'Previous' -and $pageIndex -gt 0) {
+                $pageIndex--
+                break
+            }
+            if ($command -eq 'Next' -and $pageIndex -lt ($page.PageCount - 1)) {
+                $pageIndex++
+                break
+            }
+        }
+    }
 }
 
 function Show-DownloadHistory {
-    Write-Heading -Text 'Download history - biggest to smallest'
     if (-not (Test-Path -LiteralPath $script:HistoryPath)) {
+        Clear-Terminal
+        Write-Heading -Text 'Download history - biggest to smallest'
         Write-Host "No downloads have been recorded by Seen's yt-dlp Downloader yet." -ForegroundColor Yellow
         Pause-Terminal
         return
@@ -603,6 +728,8 @@ function Show-DownloadHistory {
     try {
         $rows = @(Import-Csv -LiteralPath $script:HistoryPath)
     } catch {
+        Clear-Terminal
+        Write-Heading -Text 'Download history - biggest to smallest'
         Write-Host ('Could not read the history CSV: {0}' -f $_.Exception.Message) -ForegroundColor Red
         Pause-Terminal
         return
@@ -610,36 +737,53 @@ function Show-DownloadHistory {
 
     $sorted = @($rows | Sort-Object { [long]$_.SizeBytes } -Descending)
     if ($sorted.Count -eq 0) {
+        Clear-Terminal
+        Write-Heading -Text 'Download history - biggest to smallest'
         Write-Host 'The history file is empty.' -ForegroundColor Yellow
         Pause-Terminal
         return
     }
 
-    $index = 1
-    foreach ($row in $sorted) {
-        $size = ConvertTo-HumanSize -Bytes ([long]$row.SizeBytes)
-        Write-Host ('{0,4}. {1,12}  {2,-28}  {3}  {4}' -f $index, $size, $row.Status, $row.TimestampLocal, $row.Preset.ToUpperInvariant())
-        if (-not [string]::IsNullOrWhiteSpace($row.FilePath)) {
-            Write-Host ('      File: {0}' -f (Get-RelativeDisplayPath -Path $row.FilePath)) -ForegroundColor DarkGray
-        }
-        Write-Host ('      URL:  {0}' -f $row.Url) -ForegroundColor DarkGray
-        $index++
-    }
-
     $recordedFiles = @($rows | Where-Object { [long]$_.SizeBytes -gt 0 })
-    $totalBytes = [long](($recordedFiles | Measure-Object -Property { [long]$_.SizeBytes } -Sum).Sum)
-    Write-Host ''
-    Write-Host ('Recorded outputs: {0} files, {1} ({2:N0} bytes)' -f $recordedFiles.Count, (ConvertTo-HumanSize -Bytes $totalBytes), $totalBytes) -ForegroundColor Green
-    Write-Host ('CSV: {0}' -f (Get-RelativeDisplayPath -Path $script:HistoryPath)) -ForegroundColor DarkGray
-    Pause-Terminal
+    $totalBytes = [long](($recordedFiles | ForEach-Object { [long]$_.SizeBytes } | Measure-Object -Sum).Sum)
+    $pageIndex = 0
+    while ($true) {
+        $page = Get-PageInfo -Items $sorted -PageIndex $pageIndex -PageSize 5
+        Clear-Terminal
+        Write-Heading -Text 'Download history - biggest to smallest'
+        $index = $page.StartIndex + 1
+        foreach ($row in $page.Items) {
+            $size = ConvertTo-HumanSize -Bytes ([long]$row.SizeBytes)
+            Write-Host ('{0,4}. {1,12}  {2,-28}  {3}  {4}' -f $index, $size, $row.Status, $row.TimestampLocal, $row.Preset.ToUpperInvariant())
+            if (-not [string]::IsNullOrWhiteSpace($row.FilePath)) {
+                Write-Host ('      File: {0}' -f (Get-RelativeDisplayPath -Path $row.FilePath)) -ForegroundColor DarkGray
+            }
+            Write-Host ('      URL:  {0}' -f $row.Url) -ForegroundColor DarkGray
+            $index++
+        }
+
+        Write-Host ''
+        Write-Host ('Recorded outputs: {0} files, {1} ({2:N0} bytes)' -f $recordedFiles.Count, (ConvertTo-HumanSize -Bytes $totalBytes), $totalBytes) -ForegroundColor Green
+        Write-Host ('CSV: {0}' -f (Get-RelativeDisplayPath -Path $script:HistoryPath)) -ForegroundColor DarkGray
+        Write-PageFooter -PageNumber $page.PageNumber -PageCount $page.PageCount
+
+        while ($true) {
+            $command = Read-PageCommand
+            if ($command -eq 'Exit') { return }
+            if ($command -eq 'Previous' -and $pageIndex -gt 0) {
+                $pageIndex--
+                break
+            }
+            if ($command -eq 'Next' -and $pageIndex -lt ($page.PageCount - 1)) {
+                $pageIndex++
+                break
+            }
+        }
+    }
 }
 
 function Show-MainMenu {
-    try {
-        Clear-Host
-    } catch {
-        # Redirected/non-interactive consoles may not expose a valid cursor handle.
-    }
+    Clear-Terminal
     Write-Host '=============================================' -ForegroundColor Cyan
     Write-Host "          SEEN'S yt-dlp DOWNLOADER" -ForegroundColor White
     Write-Host '=============================================' -ForegroundColor Cyan
