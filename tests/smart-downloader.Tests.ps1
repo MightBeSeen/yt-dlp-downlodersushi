@@ -28,7 +28,7 @@ $script:loadingDownloader = $true
 function Clear-Host {}
 function Read-Host {
     param([string]$Prompt)
-    if ($script:loadingDownloader) { return '4' }
+    if ($script:loadingDownloader) { return '5' }
     if ($script:promptAnswers.Count -eq 0) { return '' }
     return $script:promptAnswers.Dequeue()
 }
@@ -63,7 +63,9 @@ $script:DownloadsRoot = Join-Path $testRoot 'Downloads'
 $script:LogsRoot = Join-Path $testRoot 'logs'
 $script:HistoryPath = Join-Path $script:LogsRoot 'download-history.csv'
 $script:promptAnswers = New-Object System.Collections.Generic.Queue[string]
+# Prompt order: URL, format ('' -> mp4), video quality ('' -> best), live mode (N -> normal).
 $script:promptAnswers.Enqueue('https://www.youtube.com/watch?v=yxf9w1gJea4')
+$script:promptAnswers.Enqueue('')
 $script:promptAnswers.Enqueue('')
 $script:promptAnswers.Enqueue('N')
 $script:promptAnswers.Enqueue('')
@@ -82,14 +84,20 @@ $capturedProgressRows = @(
         Where-Object { $_ -match '^\[download\]\s+\d+(?:\.\d+)?%' }
 )
 $carriageReturnUpdates = [regex]::Matches($terminalOutput, "`r\[download\]\s+\d+(?:\.\d+)?%").Count
+Assert-True -Condition ($downloadOutput -match '(?m)^ARGS:.*--js-runtimes\s+node(?:\s|$)') -Message 'download enables the installed Node.js runtime for YouTube extraction'
 Assert-True -Condition ($downloadOutput -match '(?m)^ARGS:.*--progress(?:\s|$)') -Message 'download explicitly restores yt-dlp progress output'
 Assert-True -Condition ($downloadOutput -match '(?m)^ARGS:.*--newline(?:\s|$)') -Message 'download emits line-oriented progress through the PowerShell pipeline'
 Assert-True -Condition ($capturedProgressRows.Count -le 1) -Message 'progress refreshes do not create newline-separated terminal spam'
 Assert-True -Condition ($carriageReturnUpdates -ge 2) -Message 'progress refreshes overwrite one terminal status line'
 Assert-True -Condition ($downloadOutput -notmatch 'Could not update download history') -Message 'successful download records history without a Generic.List conversion error'
 Assert-True -Condition (Test-Path -LiteralPath $script:HistoryPath -PathType Leaf) -Message 'successful download creates the history CSV'
+Assert-True -Condition ($downloadOutput -notmatch 'height<=') -Message 'best-quality video download does not add a resolution ceiling'
+Assert-True -Condition ($null -ne (Get-Command Read-VideoQuality -ErrorAction SilentlyContinue)) -Message 'video quality picker is available'
+Assert-True -Condition ($null -ne $script:JsRuntime) -Message 'a JavaScript runtime (node or deno) is detected'
+Assert-True -Condition ($null -ne (Get-Command Install-NodeRuntime -ErrorAction SilentlyContinue)) -Message 'node auto-install helper is available'
+Assert-True -Condition ($null -ne (Get-Command Install-FfmpegLocal -ErrorAction SilentlyContinue)) -Message 'ffmpeg auto-download helper is available'
 
-$startupOutput = @('4') | & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $downloaderPath 2>&1 | Out-String
+$startupOutput = @('5') | & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $downloaderPath 2>&1 | Out-String
 $startupExitCode = $LASTEXITCODE
 Assert-True -Condition ($startupExitCode -eq 0) -Message 'redirected/non-interactive startup exits cleanly'
 Assert-True -Condition ($startupOutput -notmatch 'CursorPosition') -Message 'redirected startup does not fail while clearing the screen'

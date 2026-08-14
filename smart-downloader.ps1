@@ -9,6 +9,40 @@ if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
 
 $script:Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:YtDlp = Join-Path $script:Root 'yt-dlp.exe'
+
+# Make helpers that live beside the script (e.g. a downloaded ffmpeg.exe) discoverable to
+# both this process and the yt-dlp child process, without touching the system PATH.
+if (($env:PATH -split ';') -notcontains $script:Root) {
+    $env:PATH = $script:Root + ';' + $env:PATH
+}
+
+function Test-CommandAvailable {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    return ($null -ne (Get-Command ('{0}.exe' -f $Name) -ErrorAction SilentlyContinue)) -or
+           ($null -ne (Get-Command $Name -ErrorAction SilentlyContinue))
+}
+
+# YouTube extraction needs a JavaScript runtime. Detect Node.js or Deno (both work) and
+# tell yt-dlp which one to use. Prefer whichever is present so the tool keeps working when
+# handed to a machine that only has one of them.
+function Update-JsRuntimeState {
+    $script:JsRuntime = $null
+    foreach ($candidate in @('node', 'deno')) {
+        if (Test-CommandAvailable -Name $candidate) {
+            $script:JsRuntime = $candidate
+            break
+        }
+    }
+    if ($null -ne $script:JsRuntime) {
+        $script:YtDlpBaseArguments = @('--js-runtimes', $script:JsRuntime)
+    } else {
+        $script:YtDlpBaseArguments = @()
+    }
+}
+
+Update-JsRuntimeState
+$script:FfmpegAvailable = Test-CommandAvailable -Name 'ffmpeg'
 $script:DownloadsRoot = Join-Path $script:Root 'Downloads'
 $script:LogsRoot = Join-Path $script:Root 'logs'
 $script:HistoryPath = Join-Path $script:LogsRoot 'download-history.csv'
@@ -294,7 +328,7 @@ function Test-UrlHasVideoItem {
 function Get-MetadataProbe {
     param([Parameter(Mandatory = $true)][string]$Url)
 
-    $probeArguments = @(
+    $probeArguments = @($script:YtDlpBaseArguments) + @(
         '--dump-single-json',
         '--flat-playlist',
         '--skip-download',
@@ -330,23 +364,62 @@ function Get-MetadataProbe {
 }
 
 function Read-FormatPreset {
+    $audioEnabled = $script:FfmpegAvailable
     while ($true) {
         Write-Host ''
         Write-Host 'Choose a format:' -ForegroundColor Cyan
         Write-Host '  1. MP4 video (compatible H.264/AAC)'
-        Write-Host '  2. MP3 audio'
+        if ($audioEnabled) {
+            Write-Host '  2. MP3 audio'
+        } else {
+            Write-Host '  2. MP3 audio (needs FFmpeg - unavailable)' -ForegroundColor DarkGray
+        }
         Write-Host '  3. MKV video (best available codecs)'
-        Write-Host '  4. AAC audio'
+        if ($audioEnabled) {
+            Write-Host '  4. AAC audio'
+        } else {
+            Write-Host '  4. AAC audio (needs FFmpeg - unavailable)' -ForegroundColor DarkGray
+        }
+        if (-not $audioEnabled) {
+            Write-Host '  FFmpeg was not found on PATH, so audio extraction is disabled.' -ForegroundColor Yellow
+            Write-Host '  Install it from https://ffmpeg.org/ and add it to PATH to enable MP3/AAC.' -ForegroundColor Yellow
+        }
         Write-Host '  C. Cancel'
         $choice = (Read-Host 'Format [1]').Trim().ToUpperInvariant()
         if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '1' }
         switch ($choice) {
             '1' { return 'mp4' }
-            '2' { return 'mp3' }
+            '2' {
+                if ($audioEnabled) { return 'mp3' }
+                Write-Host 'MP3 needs FFmpeg, which was not found. Choose 1 or 3, or install FFmpeg.' -ForegroundColor Yellow
+            }
             '3' { return 'mkv' }
-            '4' { return 'aac' }
+            '4' {
+                if ($audioEnabled) { return 'aac' }
+                Write-Host 'AAC needs FFmpeg, which was not found. Choose 1 or 3, or install FFmpeg.' -ForegroundColor Yellow
+            }
             'C' { return $null }
             default { Write-Host 'Please choose 1, 2, 3, 4, or C.' -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Read-VideoQuality {
+    while ($true) {
+        Write-Host ''
+        Write-Host 'Choose a maximum video quality:' -ForegroundColor Cyan
+        Write-Host '  1. Best available (recommended)'
+        Write-Host '  2. Up to 1080p'
+        Write-Host '  3. Up to 720p'
+        Write-Host '  C. Cancel'
+        $choice = (Read-Host 'Quality [1]').Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '1' }
+        switch ($choice) {
+            '1' { return 'best' }
+            '2' { return '1080' }
+            '3' { return '720' }
+            'C' { return $null }
+            default { Write-Host 'Please choose 1, 2, 3, or C.' -ForegroundColor Yellow }
         }
     }
 }
@@ -549,6 +622,13 @@ function Start-SmartDownload {
 
     $preset = Read-FormatPreset
     if ($null -eq $preset) { return }
+
+    $quality = 'best'
+    if ($preset -in @('mp4', 'mkv')) {
+        $quality = Read-VideoQuality
+        if ($null -eq $quality) { return }
+    }
+
     $requestedLiveMode = Read-LiveMode
     if ($null -eq $requestedLiveMode) { return }
 
@@ -583,7 +663,13 @@ function Start-SmartDownload {
     # --print enables yt-dlp's quiet mode implicitly, so restore progress explicitly.
     # The output is consumed by a line-oriented PowerShell pipeline; --newline makes
     # percentage, speed, downloaded size, and ETA updates visible as they arrive.
-    $arguments = @('-t', $preset, '-P', $targetFolder, '--progress', '--newline')
+    $arguments = @($script:YtDlpBaseArguments) + @('-t', $preset, '-P', $targetFolder, '--progress', '--newline')
+    # The mp4/mkv presets only set container remux + a sort key, so an explicit -f
+    # height ceiling composes cleanly to cap resolution without a hard failure when
+    # the requested height is unavailable (it falls back to the best that fits).
+    if ($preset -in @('mp4', 'mkv') -and $quality -ne 'best') {
+        $arguments += @('-f', ('bv*[height<={0}]+ba/b[height<={0}]' -f $quality))
+    }
     if ($liveDecision.Enabled) {
         $arguments += '--live-from-start'
     }
@@ -592,8 +678,19 @@ function Start-SmartDownload {
     }
     $arguments += @('--print', ('after_move:{0}%(filepath)s' -f $script:OutputMarker), '--', $url)
 
+    $qualityLabel = if ($preset -in @('mp4', 'mkv')) {
+        if ($quality -eq 'best') { 'Best' } else { ('{0}p' -f $quality) }
+    } else {
+        'n/a'
+    }
+    $presetRecord = if ($preset -in @('mp4', 'mkv') -and $quality -ne 'best') {
+        '{0}/{1}p' -f $preset, $quality
+    } else {
+        $preset
+    }
+
     Write-Heading -Text 'Downloading'
-    Write-Host ('Format: {0} | Live: {1} | Playlist: {2}' -f $preset.ToUpperInvariant(), $liveDecision.Description, $playlistMode)
+    Write-Host ('Format: {0} | Quality: {1} | Live: {2} | Playlist: {3}' -f $preset.ToUpperInvariant(), $qualityLabel, $liveDecision.Description, $playlistMode)
     Write-Host ('Destination: {0}' -f (Get-RelativeDisplayPath -Path $targetFolder))
     Write-Host 'Press Ctrl+C once if you need to interrupt the download.' -ForegroundColor DarkGray
     Write-Host ''
@@ -644,18 +741,18 @@ function Start-SmartDownload {
 
     if ($exitCode -eq 0) {
         foreach ($file in $completedFiles) {
-            $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset $preset -LiveMode $liveDecision.Description -PlaylistMode $playlistMode -Status 'Completed' -File $file))
+            $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset $presetRecord -LiveMode $liveDecision.Description -PlaylistMode $playlistMode -Status 'Completed' -File $file))
         }
         if ($completedFiles.Count -eq 0) {
-            $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset $preset -LiveMode $liveDecision.Description -PlaylistMode $playlistMode -Status 'No new file' -File $null))
+            $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset $presetRecord -LiveMode $liveDecision.Description -PlaylistMode $playlistMode -Status 'No new file' -File $null))
         }
     } else {
         $partialStatus = if ($interrupted) { 'Completed before interruption' } else { 'Completed before failure' }
         foreach ($file in $completedFiles) {
-            $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset $preset -LiveMode $liveDecision.Description -PlaylistMode $playlistMode -Status $partialStatus -File $file))
+            $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset $presetRecord -LiveMode $liveDecision.Description -PlaylistMode $playlistMode -Status $partialStatus -File $file))
         }
         $attemptStatus = if ($interrupted) { 'Interrupted' } else { 'Failed (exit {0})' -f $exitCode }
-        $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset $preset -LiveMode $liveDecision.Description -PlaylistMode $playlistMode -Status $attemptStatus -File $null))
+        $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset $presetRecord -LiveMode $liveDecision.Description -PlaylistMode $playlistMode -Status $attemptStatus -File $null))
     }
 
     try {
@@ -782,6 +879,95 @@ function Show-DownloadHistory {
     }
 }
 
+function Update-DownloaderEngine {
+    Write-Heading -Text 'Update downloader engine'
+    Write-Host 'Checking for a newer yt-dlp.exe...' -ForegroundColor DarkGray
+    Write-Host ''
+    try {
+        & $script:YtDlp @($script:YtDlpBaseArguments) -U 2>&1 | ForEach-Object { Write-Host ([string]$_) }
+        $exitCode = $LASTEXITCODE
+        Write-Host ''
+        if ($exitCode -eq 0) {
+            Write-Host 'yt-dlp is up to date (or was updated successfully).' -ForegroundColor Green
+        } else {
+            Write-Host ('The update command finished with exit code {0}.' -f $exitCode) -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host ('Could not update yt-dlp: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    }
+    Pause-Terminal
+}
+
+function Install-NodeRuntime {
+    Write-Host ''
+    Write-Host 'Node.js can be installed automatically with winget (Windows Package Manager).' -ForegroundColor Cyan
+    $answer = (Read-Host 'Install Node.js now? [Y]es / [N]o').Trim().ToUpperInvariant()
+    if ($answer -notin @('', 'Y', 'YES')) {
+        return $false
+    }
+
+    if (-not (Test-CommandAvailable -Name 'winget')) {
+        Write-Host 'winget is not available on this PC.' -ForegroundColor Yellow
+        Write-Host 'Install Node.js manually from https://nodejs.org/ (get the LTS installer), then run this again.' -ForegroundColor Yellow
+        return $false
+    }
+
+    Write-Host 'Installing Node.js LTS. You may see a Windows security (UAC) prompt - choose Yes.' -ForegroundColor DarkGray
+    Write-Host ''
+    try {
+        & winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements 2>&1 |
+            ForEach-Object { Write-Host ([string]$_) }
+    } catch {
+        Write-Host ('Node.js installation failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        return $false
+    }
+
+    # winget installs Node to its default location, but the new PATH entry is not visible to
+    # this already-running process. Add the default folder so we can use it immediately.
+    $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
+    if ((Test-Path -LiteralPath (Join-Path $nodeDir 'node.exe')) -and (($env:PATH -split ';') -notcontains $nodeDir)) {
+        $env:PATH = $nodeDir + ';' + $env:PATH
+    }
+    return (Test-CommandAvailable -Name 'node')
+}
+
+function Install-FfmpegLocal {
+    Write-Host ''
+    Write-Host 'FFmpeg can be downloaded (about 80 MB) straight into this folder - no install needed.' -ForegroundColor Cyan
+    $answer = (Read-Host 'Download FFmpeg now? [Y]es / [N]o').Trim().ToUpperInvariant()
+    if ($answer -notin @('', 'Y', 'YES')) {
+        return $false
+    }
+
+    $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+    $tempZip = Join-Path ([System.IO.Path]::GetTempPath()) ('ffmpeg-{0}.zip' -f ([guid]::NewGuid().ToString('N')))
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ffmpeg-{0}' -f ([guid]::NewGuid().ToString('N')))
+    $succeeded = $false
+    try {
+        Write-Host 'Downloading FFmpeg...' -ForegroundColor DarkGray
+        $previousProgress = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $url -OutFile $tempZip -UseBasicParsing
+        $ProgressPreference = $previousProgress
+        Write-Host 'Extracting FFmpeg...' -ForegroundColor DarkGray
+        Expand-Archive -LiteralPath $tempZip -DestinationPath $tempDir -Force
+        foreach ($name in @('ffmpeg.exe', 'ffprobe.exe')) {
+            $found = Get-ChildItem -LiteralPath $tempDir -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($null -ne $found) {
+                Copy-Item -LiteralPath $found.FullName -Destination (Join-Path $script:Root $name) -Force
+            }
+        }
+        $succeeded = Test-Path -LiteralPath (Join-Path $script:Root 'ffmpeg.exe')
+    } catch {
+        Write-Host ('FFmpeg download failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    } finally {
+        if (Test-Path -LiteralPath $tempZip) { Remove-Item -LiteralPath $tempZip -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $tempDir) { Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    return $succeeded
+}
+
 function Show-MainMenu {
     Clear-Terminal
     Write-Host '=============================================' -ForegroundColor Cyan
@@ -790,7 +976,8 @@ function Show-MainMenu {
     Write-Host '  1. Download a video, audio, live, or playlist'
     Write-Host '  2. View media library sizes'
     Write-Host '  3. View recorded download history'
-    Write-Host '  4. Exit'
+    Write-Host '  4. Update downloader engine (yt-dlp)'
+    Write-Host '  5. Exit'
     Write-Host ''
 }
 
@@ -799,9 +986,33 @@ if (-not (Test-Path -LiteralPath $script:YtDlp -PathType Leaf)) {
     exit 1
 }
 
-if ($null -eq (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) {
-    Write-Host 'Warning: ffmpeg was not found on PATH. MP3/AAC extraction and some video merges may fail.' -ForegroundColor Yellow
-    Pause-Terminal
+if ($null -eq $script:JsRuntime) {
+    Write-Host 'No JavaScript runtime was found on PATH.' -ForegroundColor Red
+    Write-Host 'yt-dlp needs Node.js (or Deno) to extract YouTube and many other sites.' -ForegroundColor Red
+    if (Install-NodeRuntime) {
+        Update-JsRuntimeState
+    }
+    if ($null -eq $script:JsRuntime) {
+        Write-Host ''
+        Write-Host 'A JavaScript runtime is still not available.' -ForegroundColor Red
+        Write-Host 'Install Node.js from https://nodejs.org/, reopen a terminal, then run this again.' -ForegroundColor Yellow
+        Pause-Terminal
+        exit 1
+    }
+    Write-Host 'Node.js is ready.' -ForegroundColor Green
+}
+
+if (-not $script:FfmpegAvailable) {
+    Write-Host 'FFmpeg was not found on PATH.' -ForegroundColor Yellow
+    Write-Host 'It is needed for MP3/AAC audio and some high-quality video merges.' -ForegroundColor Yellow
+    if (Install-FfmpegLocal) {
+        $script:FfmpegAvailable = $true
+        Write-Host 'FFmpeg is ready.' -ForegroundColor Green
+    } else {
+        Write-Host 'Continuing without FFmpeg. Audio presets are disabled; video-only still works.' -ForegroundColor Yellow
+        Write-Host 'You can also install it yourself from https://ffmpeg.org/ and add it to PATH.' -ForegroundColor Yellow
+        Pause-Terminal
+    }
 }
 
 while ($true) {
@@ -812,14 +1023,15 @@ while ($true) {
         '1' { Start-SmartDownload }
         '2' { Show-LibraryReport }
         '3' { Show-DownloadHistory }
-        '4' { break }
+        '4' { Update-DownloaderEngine }
+        '5' { break }
         'Q' { break }
         default {
-            Write-Host 'Please choose 1, 2, 3, or 4.' -ForegroundColor Yellow
+            Write-Host 'Please choose 1, 2, 3, 4, or 5.' -ForegroundColor Yellow
             Start-Sleep -Seconds 1
         }
     }
-    if ($menuChoice -in @('4', 'Q')) { break }
+    if ($menuChoice -in @('5', 'Q')) { break }
 }
 
 Write-Host 'Goodbye.' -ForegroundColor Cyan

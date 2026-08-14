@@ -1,0 +1,41 @@
+========================================
+  SEEN'S yt-dlp DOWNLOADER  -  READ ME FIRST
+========================================
+
+HOW TO RUN
+----------
+1. Keep ALL the files in this folder together (don't move just one out).
+2. Double-click:  Seen's yt-dlp Downloader.cmd
+3. Follow the on-screen menu. That's it.
+
+
+FIRST RUN: IT SETS ITSELF UP
+----------------------------
+The tool needs two free helpers. If either is missing, it will OFFER TO
+INSTALL THEM FOR YOU when you start it - just answer "Y":
+
+  * Node.js  -> installed automatically via winget (needed for YouTube).
+               You may see a Windows "Do you want to allow..." (UAC) box.
+               Click YES. If it asks you to reopen the tool afterward, do that.
+
+  * FFmpeg   -> downloaded straight into this folder (about 80 MB, no install).
+               Only needed for MP3/AAC audio and best-quality video merges.
+               If you skip it, video downloads still work fine.
+
+You don't have to install anything by hand. If for some reason the automatic
+setup can't run, the tool tells you exactly what to get and where.
+
+
+WHERE DO MY DOWNLOADS GO?
+-------------------------
+Into a "Downloads" folder that appears next to the .cmd, sorted by date.
+
+
+TROUBLESHOOTING
+---------------
+- Node install needs "winget" (built into Windows 10/11). If it's missing,
+  get Node.js manually from https://nodejs.org/ (the "LTS" installer).
+- A site suddenly stopped working -> open the tool and choose menu option 4,
+  "Update downloader engine".
+
+Enjoy!
