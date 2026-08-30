@@ -46,6 +46,7 @@ $script:FfmpegAvailable = Test-CommandAvailable -Name 'ffmpeg'
 $script:DownloadsRoot = Join-Path $script:Root 'Downloads'
 $script:LogsRoot = Join-Path $script:Root 'logs'
 $script:HistoryPath = Join-Path $script:LogsRoot 'download-history.csv'
+$script:SettingsPath = Join-Path $script:LogsRoot 'settings.json'
 $script:OutputMarker = '__SMART_DOWNLOADER_FILE__:'
 $script:MediaExtensions = @(
     '.mp4', '.mkv', '.webm', '.mov', '.avi', '.flv',
@@ -363,85 +364,230 @@ function Get-MetadataProbe {
     }
 }
 
-function Read-FormatPreset {
-    $audioEnabled = $script:FfmpegAvailable
-    while ($true) {
-        Write-Host ''
-        Write-Host 'Choose a format:' -ForegroundColor Cyan
-        Write-Host '  1. MP4 video (compatible H.264/AAC)'
-        if ($audioEnabled) {
-            Write-Host '  2. MP3 audio'
-        } else {
-            Write-Host '  2. MP3 audio (needs FFmpeg - unavailable)' -ForegroundColor DarkGray
-        }
-        Write-Host '  3. MKV video (best available codecs)'
-        if ($audioEnabled) {
-            Write-Host '  4. AAC audio'
-        } else {
-            Write-Host '  4. AAC audio (needs FFmpeg - unavailable)' -ForegroundColor DarkGray
-        }
-        if (-not $audioEnabled) {
-            Write-Host '  FFmpeg was not found on PATH, so audio extraction is disabled.' -ForegroundColor Yellow
-            Write-Host '  Install it from https://ffmpeg.org/ and add it to PATH to enable MP3/AAC.' -ForegroundColor Yellow
-        }
-        Write-Host '  C. Cancel'
-        $choice = (Read-Host 'Format [1]').Trim().ToUpperInvariant()
-        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '1' }
-        switch ($choice) {
-            '1' { return 'mp4' }
-            '2' {
-                if ($audioEnabled) { return 'mp3' }
-                Write-Host 'MP3 needs FFmpeg, which was not found. Choose 1 or 3, or install FFmpeg.' -ForegroundColor Yellow
-            }
-            '3' { return 'mkv' }
-            '4' {
-                if ($audioEnabled) { return 'aac' }
-                Write-Host 'AAC needs FFmpeg, which was not found. Choose 1 or 3, or install FFmpeg.' -ForegroundColor Yellow
-            }
-            'C' { return $null }
-            default { Write-Host 'Please choose 1, 2, 3, 4, or C.' -ForegroundColor Yellow }
+function Read-MenuChoice {
+    # A single reusable picker. In a real console it draws an arrow-key menu that
+    # highlights the current row and redraws in place; when input is redirected (the
+    # test harness, or any piped run) it falls back to a numbered Read-Host prompt so
+    # existing automation keeps working. Returns the chosen option's Value, the string
+    # 'BACK' (when -AllowBack and the user steps back), or $null (cancel).
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][object[]]$Options,
+        [string[]]$Notes = @(),
+        [switch]$AllowBack
+    )
+
+    # Normalise each option to a consistent shape and precompute the default (first
+    # selectable) index so Enter keeps yielding the historical default in both modes.
+    $items = @()
+    foreach ($option in $Options) {
+        $items += [pscustomobject]@{
+            Key      = [string](Get-PropertyValue -InputObject $option -Name 'Key')
+            Label    = [string](Get-PropertyValue -InputObject $option -Name 'Label')
+            Value    = (Get-PropertyValue -InputObject $option -Name 'Value')
+            Disabled = [bool](Get-PropertyValue -InputObject $option -Name 'Disabled')
         }
     }
+    $defaultIndex = 0
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        if (-not $items[$i].Disabled) { $defaultIndex = $i; break }
+    }
+
+    $canDrawArrows = $false
+    try { $canDrawArrows = -not [Console]::IsInputRedirected } catch { $canDrawArrows = $false }
+
+    if (-not $canDrawArrows) {
+        return (Read-MenuChoiceText -Title $Title -Items $items -Notes $Notes -AllowBack:$AllowBack -DefaultIndex $defaultIndex)
+    }
+
+    return (Read-MenuChoiceArrows -Title $Title -Items $items -Notes $Notes -AllowBack:$AllowBack -DefaultIndex $defaultIndex)
+}
+
+function Read-MenuChoiceText {
+    param(
+        [string]$Title,
+        [object[]]$Items,
+        [string[]]$Notes,
+        [switch]$AllowBack,
+        [int]$DefaultIndex
+    )
+
+    $keyList = ($Items | Where-Object { -not $_.Disabled } | ForEach-Object { $_.Key })
+    $hint = ($keyList -join ', ')
+    if ($AllowBack) { $hint = "$hint, B" }
+    $hint = "$hint, C"
+    $defaultKey = $Items[$DefaultIndex].Key
+
+    while ($true) {
+        Write-Host ''
+        Write-Host ("{0}:" -f $Title) -ForegroundColor Cyan
+        foreach ($note in $Notes) { Write-Host ("  {0}" -f $note) -ForegroundColor Yellow }
+        foreach ($item in $Items) {
+            $line = ("  {0}. {1}" -f $item.Key, $item.Label)
+            if ($item.Disabled) { Write-Host $line -ForegroundColor DarkGray } else { Write-Host $line }
+        }
+        if ($AllowBack) { Write-Host '  B. Back' }
+        Write-Host '  C. Cancel'
+
+        $choice = (Read-Host ("Choose [{0}]" -f $defaultKey)).Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultKey.ToUpperInvariant() }
+        if ($choice -eq 'C') { return $null }
+        if ($AllowBack -and $choice -eq 'B') { return 'BACK' }
+
+        $match = $Items | Where-Object { $_.Key.ToUpperInvariant() -eq $choice } | Select-Object -First 1
+        if ($null -ne $match) {
+            if ($match.Disabled) {
+                Write-Host 'That option is unavailable right now. Pick another.' -ForegroundColor Yellow
+            } else {
+                return $match.Value
+            }
+        } else {
+            Write-Host ("Please choose one of: {0}." -f $hint) -ForegroundColor Yellow
+        }
+    }
+}
+
+function Read-MenuChoiceArrows {
+    param(
+        [string]$Title,
+        [object[]]$Items,
+        [string[]]$Notes,
+        [switch]$AllowBack,
+        [int]$DefaultIndex
+    )
+
+    $selected = $DefaultIndex
+    $footer = if ($AllowBack) {
+        [char]0x2191 + [char]0x2193 + ' move  ' + [char]0x00B7 + '  Enter select  ' + [char]0x00B7 + '  ' + [char]0x2190 + ' Back  ' + [char]0x00B7 + '  Esc cancel'
+    } else {
+        [char]0x2191 + [char]0x2193 + ' move  ' + [char]0x00B7 + '  Enter select  ' + [char]0x00B7 + '  Esc cancel'
+    }
+
+    $linesDrawn = 0
+    $startTop = [Console]::CursorTop
+    $firstPaint = $true
+    $cursorWasVisible = $true
+    try { $cursorWasVisible = [Console]::CursorVisible } catch { $cursorWasVisible = $true }
+
+    $moveTo = {
+        param([int]$Index, [int]$Step)
+        $count = $Items.Count
+        $i = $Index
+        for ($n = 0; $n -lt $count; $n++) {
+            $i = (($i + $Step) % $count + $count) % $count
+            if (-not $Items[$i].Disabled) { return $i }
+        }
+        return $Index
+    }
+
+    try {
+        try { [Console]::CursorVisible = $false } catch {}
+        # If the very first item is disabled the default already skipped it; ensure the
+        # starting selection is landable.
+        if ($Items[$selected].Disabled) { $selected = (& $moveTo $selected 1) }
+
+        while ($true) {
+            # Repaint in place: rewind to the row where the menu began.
+            if (-not $firstPaint) {
+                try { [Console]::SetCursorPosition(0, $startTop) } catch {}
+            }
+
+            $width = 0
+            try { $width = [Console]::BufferWidth } catch { $width = 80 }
+
+            # Draw header lines, then the option rows with color.
+            Write-Host ''
+            Write-Host ("  {0}" -f $Title) -ForegroundColor Cyan
+            foreach ($note in $Notes) { Write-Host ("    {0}" -f $note) -ForegroundColor Yellow }
+            Write-Host ''
+
+            for ($idx = 0; $idx -lt $Items.Count; $idx++) {
+                $item = $Items[$idx]
+                $marker = if ($idx -eq $selected) { '> ' } else { '  ' }
+                $text = ("{0}{1}  {2}" -f $marker, $item.Key, $item.Label)
+                if ($text.Length -lt ($width - 1)) { $text = $text.PadRight($width - 1) }
+                if ($item.Disabled) {
+                    Write-Host $text -ForegroundColor DarkGray
+                } elseif ($idx -eq $selected) {
+                    Write-Host $text -ForegroundColor Black -BackgroundColor Cyan
+                } else {
+                    Write-Host $text
+                }
+            }
+            Write-Host ''
+            $footerLine = ("  {0}" -f $footer)
+            if ($footerLine.Length -lt ($width - 1)) { $footerLine = $footerLine.PadRight($width - 1) }
+            Write-Host $footerLine -ForegroundColor DarkGray
+
+            if ($firstPaint) {
+                # Header(3 or more) + options + blank + footer. Compute from where we are.
+                $linesDrawn = [Console]::CursorTop - $startTop
+                if ($linesDrawn -lt 1) { $linesDrawn = 1 }
+                $startTop = [Console]::CursorTop - $linesDrawn
+                $firstPaint = $false
+            }
+
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                'UpArrow'    { $selected = (& $moveTo $selected -1) }
+                'DownArrow'  { $selected = (& $moveTo $selected 1) }
+                'Enter'      { if (-not $Items[$selected].Disabled) { return $Items[$selected].Value } }
+                'Escape'     { return $null }
+                'LeftArrow'  { if ($AllowBack) { return 'BACK' } }
+                'Backspace'  { if ($AllowBack) { return 'BACK' } }
+                default {
+                    $ch = ([string]$key.KeyChar).ToUpperInvariant()
+                    if ($ch -eq 'C') { return $null }
+                    if ($AllowBack -and $ch -eq 'B') { return 'BACK' }
+                    $matchIndex = -1
+                    for ($m = 0; $m -lt $Items.Count; $m++) {
+                        if ($Items[$m].Key.ToUpperInvariant() -eq $ch) { $matchIndex = $m; break }
+                    }
+                    if ($matchIndex -ge 0 -and -not $Items[$matchIndex].Disabled) {
+                        return $Items[$matchIndex].Value
+                    }
+                }
+            }
+        }
+    } finally {
+        try { [Console]::CursorVisible = $cursorWasVisible } catch {}
+    }
+}
+
+function Read-FormatPreset {
+    $audioEnabled = $script:FfmpegAvailable
+    $notes = @()
+    if (-not $audioEnabled) {
+        $notes = @(
+            'FFmpeg was not found on PATH, so MP3/AAC audio extraction is disabled.',
+            'Install it from https://ffmpeg.org/ and add it to PATH to enable them.'
+        )
+    }
+    $options = @(
+        [pscustomobject]@{ Key = '1'; Label = 'MP4 video (compatible H.264/AAC)'; Value = 'mp4'; Disabled = $false }
+        [pscustomobject]@{ Key = '2'; Label = 'MP3 audio' + $(if (-not $audioEnabled) { ' (needs FFmpeg)' } else { '' }); Value = 'mp3'; Disabled = (-not $audioEnabled) }
+        [pscustomobject]@{ Key = '3'; Label = 'MKV video (best available codecs)'; Value = 'mkv'; Disabled = $false }
+        [pscustomobject]@{ Key = '4'; Label = 'AAC audio' + $(if (-not $audioEnabled) { ' (needs FFmpeg)' } else { '' }); Value = 'aac'; Disabled = (-not $audioEnabled) }
+    )
+    return (Read-MenuChoice -Title 'Choose a format' -Options $options -Notes $notes)
 }
 
 function Read-VideoQuality {
-    while ($true) {
-        Write-Host ''
-        Write-Host 'Choose a maximum video quality:' -ForegroundColor Cyan
-        Write-Host '  1. Best available (recommended)'
-        Write-Host '  2. Up to 1080p'
-        Write-Host '  3. Up to 720p'
-        Write-Host '  C. Cancel'
-        $choice = (Read-Host 'Quality [1]').Trim().ToUpperInvariant()
-        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '1' }
-        switch ($choice) {
-            '1' { return 'best' }
-            '2' { return '1080' }
-            '3' { return '720' }
-            'C' { return $null }
-            default { Write-Host 'Please choose 1, 2, 3, or C.' -ForegroundColor Yellow }
-        }
-    }
+    $options = @(
+        [pscustomobject]@{ Key = '1'; Label = 'Best available (recommended)'; Value = 'best' }
+        [pscustomobject]@{ Key = '2'; Label = 'Up to 1080p'; Value = '1080' }
+        [pscustomobject]@{ Key = '3'; Label = 'Up to 720p'; Value = '720' }
+    )
+    return (Read-MenuChoice -Title 'Choose a maximum video quality' -Options $options -AllowBack)
 }
 
 function Read-LiveMode {
-    while ($true) {
-        Write-Host ''
-        Write-Host 'Livestream handling:' -ForegroundColor Cyan
-        Write-Host '  A. Auto-detect an active live (recommended)'
-        Write-Host '  Y. Force download from the start'
-        Write-Host '  N. Normal download without live-from-start'
-        Write-Host '  C. Cancel'
-        $choice = (Read-Host 'Live mode [A]').Trim().ToUpperInvariant()
-        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'A' }
-        switch ($choice) {
-            'A' { return 'Auto' }
-            'Y' { return 'Force' }
-            'N' { return 'Normal' }
-            'C' { return $null }
-            default { Write-Host 'Please choose A, Y, N, or C.' -ForegroundColor Yellow }
-        }
-    }
+    $options = @(
+        [pscustomobject]@{ Key = 'A'; Label = 'Auto-detect an active live (recommended)'; Value = 'Auto' }
+        [pscustomobject]@{ Key = 'Y'; Label = 'Force download from the start'; Value = 'Force' }
+        [pscustomobject]@{ Key = 'N'; Label = 'Normal download without live-from-start'; Value = 'Normal' }
+    )
+    return (Read-MenuChoice -Title 'Livestream handling' -Options $options -AllowBack)
 }
 
 function Read-PlaylistMode {
@@ -456,38 +602,22 @@ function Read-PlaylistMode {
     }
 
     if ($ProbeSucceeded -and $IsPlaylist -and -not (Test-UrlHasVideoItem -Url $Url)) {
-        while ($true) {
-            Write-Host ''
-            Write-Host 'This appears to be a playlist URL without a selected video.' -ForegroundColor Yellow
-            $choice = (Read-Host 'Download the full playlist? [Y]es / [C]ancel').Trim().ToUpperInvariant()
-            if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'Y' }
-            switch ($choice) {
-                'Y' { return 'Playlist' }
-                'C' { return $null }
-                default { Write-Host 'Please choose Y or C.' -ForegroundColor Yellow }
-            }
-        }
+        $options = @(
+            [pscustomobject]@{ Key = 'Y'; Label = 'Yes, download the full playlist'; Value = 'Playlist' }
+        )
+        return (Read-MenuChoice -Title 'This looks like a playlist URL without a selected video' -Options $options -AllowBack)
     }
 
-    while ($true) {
-        Write-Host ''
-        if ($ProbeSucceeded) {
-            Write-Host 'This link can download a playlist.' -ForegroundColor Yellow
-        } else {
-            Write-Host 'Playlist detection was unavailable. Choose the safe single-video mode or allow a playlist.' -ForegroundColor Yellow
-        }
-        Write-Host '  1. Single/current video only'
-        Write-Host '  2. Full playlist'
-        Write-Host '  C. Cancel'
-        $choice = (Read-Host 'Playlist mode [1]').Trim().ToUpperInvariant()
-        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '1' }
-        switch ($choice) {
-            '1' { return 'Single' }
-            '2' { return 'Playlist' }
-            'C' { return $null }
-            default { Write-Host 'Please choose 1, 2, or C.' -ForegroundColor Yellow }
-        }
+    $notes = if ($ProbeSucceeded) {
+        @('This link can download a whole playlist.')
+    } else {
+        @('Playlist detection was unavailable. Pick the safe single-video mode, or allow a playlist.')
     }
+    $options = @(
+        [pscustomobject]@{ Key = '1'; Label = 'Single/current video only'; Value = 'Single' }
+        [pscustomobject]@{ Key = '2'; Label = 'Full playlist'; Value = 'Playlist' }
+    )
+    return (Read-MenuChoice -Title 'Playlist handling' -Options $options -Notes $notes -AllowBack)
 }
 
 function Resolve-LiveDecision {
@@ -527,6 +657,60 @@ function Resolve-LiveDecision {
             'C' { return [pscustomobject]@{ Cancelled = $true; Enabled = $false; Description = 'Cancelled' } }
             default { Write-Host 'Please choose N, L, or C.' -ForegroundColor Yellow }
         }
+    }
+}
+
+function Get-DownloaderSettings {
+    $settings = [ordered]@{ OpenFolderAfterDownload = $false }
+    if (Test-Path -LiteralPath $script:SettingsPath -PathType Leaf) {
+        try {
+            $saved = Get-Content -LiteralPath $script:SettingsPath -Raw | ConvertFrom-Json
+            $value = Get-PropertyValue -InputObject $saved -Name 'OpenFolderAfterDownload'
+            if ($value -is [bool]) {
+                $settings.OpenFolderAfterDownload = $value
+            }
+        } catch {
+            # A missing or corrupt settings file falls back to the defaults above.
+        }
+    }
+    return [pscustomobject]$settings
+}
+
+function Save-DownloaderSettings {
+    param([Parameter(Mandatory = $true)][object]$Settings)
+
+    if (-not (Test-Path -LiteralPath $script:LogsRoot)) {
+        [void](New-Item -ItemType Directory -Path $script:LogsRoot -Force)
+    }
+    $Settings | ConvertTo-Json | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
+}
+
+# Decide what to hand explorer.exe after a download. A single file is highlighted with
+# /select so the user lands right on it; anything else (a playlist, or nothing tracked)
+# just opens the folder. Kept side-effect free so it can be unit-tested.
+function Get-ExplorerLaunch {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Files,
+        [Parameter(Mandatory = $true)][string]$TargetFolder
+    )
+
+    if ($Files.Count -eq 1) {
+        return ('/select,"{0}"' -f $Files[0].FullName)
+    }
+    return ('"{0}"' -f $TargetFolder)
+}
+
+function Open-DownloadLocation {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Files,
+        [Parameter(Mandatory = $true)][string]$TargetFolder
+    )
+
+    try {
+        $argument = Get-ExplorerLaunch -Files $Files -TargetFolder $TargetFolder
+        Start-Process -FilePath 'explorer.exe' -ArgumentList $argument
+    } catch {
+        Write-Host ('Could not open the download folder: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
     }
 }
 
@@ -605,6 +789,73 @@ function Resolve-CompletedFiles {
     return @($filesByPath.Values)
 }
 
+function Show-DownloadHeader {
+    # Clears the screen and paints the fixed top block for the download setup flow:
+    # the clip title (if known) with the link underneath, then a boxed "Your choices"
+    # panel summarising what has been picked so far. Fields not yet chosen show as em-dash.
+    param(
+        [string]$Title = '',
+        [Parameter(Mandatory = $true)][string]$Url,
+        [string]$Preset = '',
+        [string]$Quality = '',
+        [string]$Live = '',
+        [string]$Playlist = ''
+    )
+
+    $dash = [char]0x2014  # em dash for empty fields
+    $labelFor = {
+        param([string]$Value, [string]$Kind)
+        if ([string]::IsNullOrEmpty($Value)) { return [string]$dash }
+        switch ($Kind) {
+            'quality' { if ($Value -eq 'best') { return 'Best' } elseif ($Value -eq 'n/a') { return 'n/a' } else { return ('{0}p' -f $Value) } }
+            'live'    { switch ($Value) { 'Auto' { return 'Auto-detect' } 'Force' { return 'Force live' } 'Normal' { return 'Normal' } default { return $Value } } }
+            'play'    { switch ($Value) { 'Single' { return 'Single video' } 'Playlist' { return 'Full playlist' } default { return $Value } } }
+            default   { return $Value.ToUpperInvariant() }
+        }
+    }
+
+    Clear-Terminal
+    Write-Heading -Text 'New download'
+
+    $width = 80
+    try { $width = [Console]::BufferWidth } catch { $width = 80 }
+
+    if (-not [string]::IsNullOrWhiteSpace($Title)) {
+        $titleLine = $Title.Trim()
+        if ($titleLine.Length -gt ($width - 2)) { $titleLine = $titleLine.Substring(0, [Math]::Max(0, $width - 3)) + [char]0x2026 }
+        Write-Host $titleLine -ForegroundColor Cyan
+    }
+    $linkLine = $Url
+    if ($linkLine.Length -gt ($width - 2)) { $linkLine = $linkLine.Substring(0, [Math]::Max(0, $width - 3)) + [char]0x2026 }
+    Write-Host $linkLine -ForegroundColor DarkGray
+
+    # Boxed "Your choices" panel.
+    $inner = 28
+    $rows = @(
+        @('Format',   (& $labelFor $Preset 'format')),
+        @('Quality',  (& $labelFor $Quality 'quality')),
+        @('Live',     (& $labelFor $Live 'live')),
+        @('Playlist', (& $labelFor $Playlist 'play'))
+    )
+    $titleTag = ' Your choices '
+    $top = [string][char]0x250C + $titleTag + ([string][char]0x2500 * ($inner - $titleTag.Length)) + [char]0x2510
+    $bottom = [string][char]0x2514 + ([string][char]0x2500 * $inner) + [char]0x2518
+
+    Write-Host ''
+    Write-Host $top -ForegroundColor DarkCyan
+    foreach ($row in $rows) {
+        $value = [string]$row[1]
+        $maxValue = $inner - 12
+        if ($value.Length -gt $maxValue) { $value = $value.Substring(0, [Math]::Max(0, $maxValue - 1)) + [char]0x2026 }
+        $content = (' {0} {1}' -f ($row[0]).PadRight(9), $value)
+        if ($content.Length -lt $inner) { $content = $content.PadRight($inner) }
+        Write-Host ([string][char]0x2502) -NoNewline -ForegroundColor DarkCyan
+        Write-Host $content -NoNewline
+        Write-Host ([string][char]0x2502) -ForegroundColor DarkCyan
+    }
+    Write-Host $bottom -ForegroundColor DarkCyan
+}
+
 function Start-SmartDownload {
     Write-Heading -Text 'New download'
 
@@ -620,35 +871,82 @@ function Start-SmartDownload {
         return
     }
 
-    $preset = Read-FormatPreset
-    if ($null -eq $preset) { return }
-
-    $quality = 'best'
-    if ($preset -in @('mp4', 'mkv')) {
-        $quality = Read-VideoQuality
-        if ($null -eq $quality) { return }
+    # Probe once, upfront, so the setup screens can show the clip title and so the
+    # playlist step never re-hits the network when you step back and forth.
+    Write-Host ''
+    Write-Host 'Fetching video details...' -ForegroundColor DarkGray
+    $probe = Get-MetadataProbe -Url $url
+    $clipTitle = ''
+    if ($probe.Success) {
+        $clipTitle = [string](Get-PropertyValue -InputObject $probe.Metadata -Name 'title')
     }
 
-    $requestedLiveMode = Read-LiveMode
-    if ($null -eq $requestedLiveMode) { return }
+    # The questions run as a small step machine so a mis-click is recoverable: each
+    # prompt offers "B. Back", which steps back exactly one question while keeping the
+    # earlier answers intact, instead of only cancelling out to the main menu.
+    # Steps: 0 Format, 1 Quality (video only), 2 Live mode, 3 Playlist.
+    $preset = $null
+    $quality = 'best'
+    $requestedLiveMode = $null
+    $playlistMode = $null
+    $step = 0
+    while ($step -le 3) {
+        # Show only choices confirmed by an *earlier* step; the field being asked now
+        # (and any later ones) stays blank, so stepping Back visibly clears it.
+        $presetDisplay  = if ($step -gt 0) { [string]$preset } else { '' }
+        $qualityDisplay = if ($step -gt 1) { if ($preset -in @('mp4', 'mkv')) { [string]$quality } else { 'n/a' } } else { '' }
+        $liveDisplay    = if ($step -gt 2) { [string]$requestedLiveMode } else { '' }
+        Show-DownloadHeader -Title $clipTitle -Url $url `
+            -Preset $presetDisplay `
+            -Quality $qualityDisplay `
+            -Live $liveDisplay `
+            -Playlist ''
+        switch ($step) {
+            0 {
+                $preset = Read-FormatPreset
+                if ($null -eq $preset) { return }  # Back on the first question cancels.
+                $step = 1
+            }
+            1 {
+                if ($preset -in @('mp4', 'mkv')) {
+                    $quality = Read-VideoQuality
+                    if ($null -eq $quality) { return }
+                    if ($quality -eq 'BACK') { $step = 0; break }
+                } else {
+                    $quality = 'best'  # Audio presets have no quality step.
+                }
+                $step = 2
+            }
+            2 {
+                $requestedLiveMode = Read-LiveMode
+                if ($null -eq $requestedLiveMode) { return }
+                if ($requestedLiveMode -eq 'BACK') {
+                    # Back skips the quality step for audio presets.
+                    $step = if ($preset -in @('mp4', 'mkv')) { 1 } else { 0 }
+                    break
+                }
+                $step = 3
+            }
+            3 {
+                if (-not $probe.Success) {
+                    Write-Host 'The metadata probe did not succeed. The download may still work.' -ForegroundColor Yellow
+                    if (-not [string]::IsNullOrWhiteSpace([string]$probe.Error)) {
+                        $errorPreview = ([string]$probe.Error -split "`r?`n" | Select-Object -Last 1)
+                        Write-Host $errorPreview -ForegroundColor DarkYellow
+                    }
+                }
 
-    Write-Host ''
-    Write-Host 'Inspecting the link for livestream and playlist information...' -ForegroundColor DarkGray
-    $probe = Get-MetadataProbe -Url $url
-    if (-not $probe.Success) {
-        Write-Host 'The metadata probe did not succeed. The download may still work.' -ForegroundColor Yellow
-        if (-not [string]::IsNullOrWhiteSpace([string]$probe.Error)) {
-            $errorPreview = ([string]$probe.Error -split "`r?`n" | Select-Object -Last 1)
-            Write-Host $errorPreview -ForegroundColor DarkYellow
+                $isPlaylist = $false
+                if ($probe.Success) {
+                    $isPlaylist = Test-MetadataIsPlaylist -Metadata $probe.Metadata
+                }
+                $playlistMode = Read-PlaylistMode -ProbeSucceeded $probe.Success -IsPlaylist $isPlaylist -Url $url
+                if ($null -eq $playlistMode) { return }
+                if ($playlistMode -eq 'BACK') { $step = 2; break }
+                $step = 4  # All questions answered; leave the loop.
+            }
         }
     }
-
-    $isPlaylist = $false
-    if ($probe.Success) {
-        $isPlaylist = Test-MetadataIsPlaylist -Metadata $probe.Metadata
-    }
-    $playlistMode = Read-PlaylistMode -ProbeSucceeded $probe.Success -IsPlaylist $isPlaylist -Url $url
-    if ($null -eq $playlistMode) { return }
 
     $liveDecision = Resolve-LiveDecision -RequestedMode $requestedLiveMode -ProbeSucceeded $probe.Success -Metadata $probe.Metadata
     if ($liveDecision.Cancelled) { return }
@@ -770,6 +1068,9 @@ function Start-SmartDownload {
         Write-Host ('yt-dlp failed with exit code {0}.' -f $exitCode) -ForegroundColor Red
     }
     Show-FileList -Files $completedFiles -IncludeTotal
+    if ($exitCode -eq 0 -and $script:Settings.OpenFolderAfterDownload -and $completedFiles.Count -gt 0) {
+        Open-DownloadLocation -Files $completedFiles -TargetFolder $targetFolder
+    }
     Pause-Terminal
 }
 
@@ -898,6 +1199,37 @@ function Update-DownloaderEngine {
     Pause-Terminal
 }
 
+function Show-SettingsMenu {
+    while ($true) {
+        Clear-Terminal
+        Write-Heading -Text 'Settings'
+        $state = if ($script:Settings.OpenFolderAfterDownload) { 'On' } else { 'Off' }
+        Write-Host ('  1. Open the download folder when a download finishes: {0}' -f $state)
+        Write-Host '  B. Back'
+        Write-Host ''
+        $choice = (Read-Host 'Choose an option to toggle [B]').Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'B' }
+        switch ($choice) {
+            '1' {
+                $script:Settings.OpenFolderAfterDownload = -not $script:Settings.OpenFolderAfterDownload
+                try {
+                    Save-DownloaderSettings -Settings $script:Settings
+                    $newState = if ($script:Settings.OpenFolderAfterDownload) { 'On' } else { 'Off' }
+                    Write-Host ('Auto-open is now {0}.' -f $newState) -ForegroundColor Green
+                } catch {
+                    Write-Host ('Could not save settings: {0}' -f $_.Exception.Message) -ForegroundColor Red
+                }
+                Start-Sleep -Seconds 1
+            }
+            'B' { return }
+            default {
+                Write-Host 'Please choose 1 or B.' -ForegroundColor Yellow
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+}
+
 function Install-NodeRuntime {
     Write-Host ''
     Write-Host 'Node.js can be installed automatically with winget (Windows Package Manager).' -ForegroundColor Cyan
@@ -977,7 +1309,8 @@ function Show-MainMenu {
     Write-Host '  2. View media library sizes'
     Write-Host '  3. View recorded download history'
     Write-Host '  4. Update downloader engine (yt-dlp)'
-    Write-Host '  5. Exit'
+    Write-Host '  5. Settings'
+    Write-Host '  6. Exit'
     Write-Host ''
 }
 
@@ -1015,6 +1348,8 @@ if (-not $script:FfmpegAvailable) {
     }
 }
 
+$script:Settings = Get-DownloaderSettings
+
 while ($true) {
     Show-MainMenu
     $menuChoice = (Read-Host 'Choose an option [1]').Trim().ToUpperInvariant()
@@ -1024,14 +1359,15 @@ while ($true) {
         '2' { Show-LibraryReport }
         '3' { Show-DownloadHistory }
         '4' { Update-DownloaderEngine }
-        '5' { break }
+        '5' { Show-SettingsMenu }
+        '6' { break }
         'Q' { break }
         default {
-            Write-Host 'Please choose 1, 2, 3, 4, or 5.' -ForegroundColor Yellow
+            Write-Host 'Please choose 1, 2, 3, 4, 5, or 6.' -ForegroundColor Yellow
             Start-Sleep -Seconds 1
         }
     }
-    if ($menuChoice -in @('5', 'Q')) { break }
+    if ($menuChoice -in @('6', 'Q')) { break }
 }
 
 Write-Host 'Goodbye.' -ForegroundColor Cyan

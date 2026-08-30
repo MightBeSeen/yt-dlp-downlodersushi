@@ -1,6 +1,6 @@
 # Seen's yt-dlp Downloader
 
-**Version:** 2026.08.14b &nbsp;·&nbsp; **Last updated:** 2026-08-14 &nbsp;·&nbsp; **Bundled yt-dlp:** 2026.07.04
+**Version:** 2026.08.30b &nbsp;·&nbsp; **Last updated:** 2026-08-30 &nbsp;·&nbsp; **Bundled yt-dlp:** 2026.08.18.122307
 
 Double-click **Seen's yt-dlp Downloader.cmd** and follow the terminal prompts.
 
@@ -11,6 +11,8 @@ Double-click **Seen's yt-dlp Downloader.cmd** and follow the terminal prompts.
 - Playlists and livestream downloads from the start (auto-detected).
 - Per-day download folders and a CSV file-size history.
 - In-app engine updates (`yt-dlp -U`) from the menu.
+- Optional auto-open: when enabled in **Settings**, Explorer opens with the finished
+  download highlighted (setting is saved in `logs\settings.json`).
 
 ## Requirements (Windows)
 
@@ -30,7 +32,8 @@ install it automatically:
 2. View media library sizes
 3. View recorded download history
 4. Update downloader engine (`yt-dlp -U`)
-5. Exit
+5. Settings (toggle auto-open after download)
+6. Exit
 
 ---
 

@@ -28,7 +28,7 @@ $script:loadingDownloader = $true
 function Clear-Host {}
 function Read-Host {
     param([string]$Prompt)
-    if ($script:loadingDownloader) { return '5' }
+    if ($script:loadingDownloader) { return '6' }
     if ($script:promptAnswers.Count -eq 0) { return '' }
     return $script:promptAnswers.Dequeue()
 }
@@ -97,7 +97,33 @@ Assert-True -Condition ($null -ne $script:JsRuntime) -Message 'a JavaScript runt
 Assert-True -Condition ($null -ne (Get-Command Install-NodeRuntime -ErrorAction SilentlyContinue)) -Message 'node auto-install helper is available'
 Assert-True -Condition ($null -ne (Get-Command Install-FfmpegLocal -ErrorAction SilentlyContinue)) -Message 'ffmpeg auto-download helper is available'
 
-$startupOutput = @('5') | & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $downloaderPath 2>&1 | Out-String
+# Settings persistence: default off, and a saved value round-trips through disk.
+$originalSettingsPath = $script:SettingsPath
+$script:SettingsPath = Join-Path $testRoot 'settings.json'
+if (Test-Path -LiteralPath $script:SettingsPath) { Remove-Item -LiteralPath $script:SettingsPath -Force }
+$defaultSettings = Get-DownloaderSettings
+Assert-True -Condition ($defaultSettings.OpenFolderAfterDownload -eq $false) -Message 'settings default to auto-open disabled when no file exists'
+$defaultSettings.OpenFolderAfterDownload = $true
+Save-DownloaderSettings -Settings $defaultSettings
+$reloadedSettings = Get-DownloaderSettings
+Assert-True -Condition ($reloadedSettings.OpenFolderAfterDownload -eq $true) -Message 'a saved auto-open setting round-trips through disk'
+$script:SettingsPath = $originalSettingsPath
+
+# Explorer launch decision: highlight a single file, open the folder otherwise.
+$singleFile = @([pscustomobject]@{ FullName = (Join-Path $testRoot 'only.mp4') })
+$singleLaunch = Get-ExplorerLaunch -Files $singleFile -TargetFolder $testRoot
+Assert-True -Condition ($singleLaunch -eq ('/select,"{0}"' -f (Join-Path $testRoot 'only.mp4'))) -Message 'a single completed file is highlighted in Explorer'
+$manyFiles = @(
+    [pscustomobject]@{ FullName = (Join-Path $testRoot 'a.mp4') },
+    [pscustomobject]@{ FullName = (Join-Path $testRoot 'b.mp4') }
+)
+$manyLaunch = Get-ExplorerLaunch -Files $manyFiles -TargetFolder $testRoot
+Assert-True -Condition ($manyLaunch -eq ('"{0}"' -f $testRoot)) -Message 'multiple completed files open the download folder'
+$emptyLaunch = Get-ExplorerLaunch -Files @() -TargetFolder $testRoot
+Assert-True -Condition ($emptyLaunch -eq ('"{0}"' -f $testRoot)) -Message 'no completed files open the download folder'
+Assert-True -Condition ($null -ne (Get-Command Show-SettingsMenu -ErrorAction SilentlyContinue)) -Message 'settings menu screen is available'
+
+$startupOutput = @('6') | & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $downloaderPath 2>&1 | Out-String
 $startupExitCode = $LASTEXITCODE
 Assert-True -Condition ($startupExitCode -eq 0) -Message 'redirected/non-interactive startup exits cleanly'
 Assert-True -Condition ($startupOutput -notmatch 'CursorPosition') -Message 'redirected startup does not fail while clearing the screen'
