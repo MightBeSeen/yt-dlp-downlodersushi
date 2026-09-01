@@ -364,6 +364,71 @@ function Get-MetadataProbe {
     }
 }
 
+# Kick the metadata probe off on a background runspace so the setup questions can be
+# answered while the network round-trip is still in flight. Runspaces share this process,
+# so the returned Metadata is a live PSCustomObject (no serialization loss like Start-Job).
+# $script:YtDlp and the base arguments are passed in explicitly so a test override of
+# $script:YtDlp is honoured inside the runspace.
+function Start-MetadataProbe {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    $worker = {
+        param([string]$YtDlp, [object[]]$BaseArguments, [string]$Url)
+
+        $probeArguments = @($BaseArguments) + @(
+            '--dump-single-json',
+            '--flat-playlist',
+            '--skip-download',
+            '--no-warnings',
+            '--',
+            $Url
+        )
+
+        try {
+            $output = (& $YtDlp @probeArguments 2>&1 | Out-String).Trim()
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($output)) {
+                return [pscustomobject]@{ Success = $false; Metadata = $null; Error = $output }
+            }
+
+            $metadata = $output | ConvertFrom-Json
+            return [pscustomobject]@{ Success = $true; Metadata = $metadata; Error = $null }
+        } catch {
+            return [pscustomobject]@{ Success = $false; Metadata = $null; Error = $_.Exception.Message }
+        }
+    }
+
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript($worker)
+    [void]$ps.AddArgument($script:YtDlp)
+    [void]$ps.AddArgument(@($script:YtDlpBaseArguments))
+    [void]$ps.AddArgument($Url)
+    $handle = $ps.BeginInvoke()
+
+    return [pscustomobject]@{ PowerShell = $ps; Handle = $handle }
+}
+
+function Test-MetadataProbeCompleted {
+    param([Parameter(Mandatory = $true)][object]$ProbeJob)
+
+    return [bool]$ProbeJob.Handle.IsCompleted
+}
+
+# Block until the background probe finishes, then tear down its runspace. Also the tidy way
+# to dispose an in-flight probe when the user cancels before the result is ever needed.
+function Complete-MetadataProbe {
+    param([Parameter(Mandatory = $true)][object]$ProbeJob)
+
+    try {
+        $result = $ProbeJob.PowerShell.EndInvoke($ProbeJob.Handle)
+    } catch {
+        $result = @([pscustomobject]@{ Success = $false; Metadata = $null; Error = $_.Exception.Message })
+    } finally {
+        try { $ProbeJob.PowerShell.Dispose() } catch {}
+    }
+    return ($result | Select-Object -First 1)
+}
+
 function Read-MenuChoice {
     # A single reusable picker. In a real console it draws an arrow-key menu that
     # highlights the current row and redraws in place; when input is redirected (the
@@ -871,16 +936,18 @@ function Start-SmartDownload {
         return
     }
 
-    # Probe once, upfront, so the setup screens can show the clip title and so the
-    # playlist step never re-hits the network when you step back and forth.
+    # Probe once, in the background, so the setup questions can be answered while the
+    # network round-trip is still in flight. The result is consumed lazily: the clip title
+    # fills into the header the moment it lands, and the playlist step (the first thing that
+    # truly needs it) blocks on it only if it somehow has not finished yet. Probing once also
+    # keeps the playlist step from re-hitting the network when you step back and forth.
     Write-Host ''
-    Write-Host 'Fetching video details...' -ForegroundColor DarkGray
-    $probe = Get-MetadataProbe -Url $url
+    Write-Host 'Fetching video details in the background - you can start choosing now.' -ForegroundColor DarkGray
+    $probeJob = Start-MetadataProbe -Url $url
+    $probe = $null
     $clipTitle = ''
-    if ($probe.Success) {
-        $clipTitle = [string](Get-PropertyValue -InputObject $probe.Metadata -Name 'title')
-    }
 
+  try {
     # The questions run as a small step machine so a mis-click is recoverable: each
     # prompt offers "B. Back", which steps back exactly one question while keeping the
     # earlier answers intact, instead of only cancelling out to the main menu.
@@ -891,6 +958,15 @@ function Start-SmartDownload {
     $playlistMode = $null
     $step = 0
     while ($step -le 3) {
+        # Pull the probe result the instant it is ready, without ever blocking, so the clip
+        # title fills into the header on the next repaint.
+        if ($null -eq $probe -and (Test-MetadataProbeCompleted -ProbeJob $probeJob)) {
+            $probe = Complete-MetadataProbe -ProbeJob $probeJob
+            if ($probe.Success) {
+                $clipTitle = [string](Get-PropertyValue -InputObject $probe.Metadata -Name 'title')
+            }
+        }
+
         # Show only choices confirmed by an *earlier* step; the field being asked now
         # (and any later ones) stays blank, so stepping Back visibly clears it.
         $presetDisplay  = if ($step -gt 0) { [string]$preset } else { '' }
@@ -928,6 +1004,16 @@ function Start-SmartDownload {
                 $step = 3
             }
             3 {
+                # First step that actually needs the metadata. Block on the fetch only if it
+                # is still running (usually it finished while the earlier questions were answered).
+                if ($null -eq $probe) {
+                    Write-Host 'Finishing video details...' -ForegroundColor DarkGray
+                    $probe = Complete-MetadataProbe -ProbeJob $probeJob
+                    if ($probe.Success) {
+                        $clipTitle = [string](Get-PropertyValue -InputObject $probe.Metadata -Name 'title')
+                    }
+                }
+
                 if (-not $probe.Success) {
                     Write-Host 'The metadata probe did not succeed. The download may still work.' -ForegroundColor Yellow
                     if (-not [string]::IsNullOrWhiteSpace([string]$probe.Error)) {
@@ -947,6 +1033,13 @@ function Start-SmartDownload {
             }
         }
     }
+  } finally {
+    # If the user cancelled before the playlist step ever consumed the probe, tear down the
+    # still-running background runspace so it does not leak.
+    if ($null -eq $probe -and $null -ne $probeJob) {
+        try { [void](Complete-MetadataProbe -ProbeJob $probeJob) } catch {}
+    }
+  }
 
     $liveDecision = Resolve-LiveDecision -RequestedMode $requestedLiveMode -ProbeSucceeded $probe.Success -Metadata $probe.Metadata
     if ($liveDecision.Cancelled) { return }
