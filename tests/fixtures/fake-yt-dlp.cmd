@@ -23,10 +23,16 @@ goto parse_args
 :run_download
 if not exist "%target%" mkdir "%target%"
 > "%target%\fake-output.mp4" echo fake media
+> "%target%\fake-output-2.mp4" echo fake media
 echo ARGS:%all_args%
+echo [download] Downloading item 1 of 2
 echo [download] 10.0%% of 1.00MiB at 1.00MiB/s ETA 00:01
 echo [download] 50.0%% of 1.00MiB at 2.00MiB/s ETA 00:01
 echo [download] 90.0%% of 1.00MiB at 3.00MiB/s ETA 00:00
 echo [download] 100.0%% of 1.00MiB at 3.00MiB/s ETA 00:00
 echo __SMART_DOWNLOADER_FILE__:%target%\fake-output.mp4
+echo [download] Downloading item 2 of 2
+echo [download] 10.0%% of 1.00MiB at 1.00MiB/s ETA 00:01
+echo [download] 100.0%% of 1.00MiB at 3.00MiB/s ETA 00:00
+echo __SMART_DOWNLOADER_FILE__:%target%\fake-output-2.mp4
 exit /b 0

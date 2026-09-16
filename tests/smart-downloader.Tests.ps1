@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 Set-StrictMode -Version 2.0
@@ -28,7 +28,7 @@ $script:loadingDownloader = $true
 function Clear-Host {}
 function Read-Host {
     param([string]$Prompt)
-    if ($script:loadingDownloader) { return '6' }
+    if ($script:loadingDownloader) { return '7' }
     if ($script:promptAnswers.Count -eq 0) { return '' }
     return $script:promptAnswers.Dequeue()
 }
@@ -79,19 +79,30 @@ try {
     [Console]::SetOut($originalConsoleOut)
 }
 $terminalOutput = $terminalWriter.ToString()
+# The download loop now drives ALL of its output - the pinned bar AND the scrolling
+# content (yt-dlp lines, "Saved:") - through the single [Console] channel so a real
+# terminal keeps the carriage-return redraws coherent. That means the yt-dlp echo lines
+# land in $terminalOutput, not the *>&1 information stream, so content assertions scan
+# both streams combined.
+$combinedOutput = $downloadOutput + "`r`n" + $terminalOutput
+# A pinned bar overwrites one line with carriage returns; a progress readout must almost
+# never be newline-terminated (that is the old "stacking" bug where each refresh landed on
+# its own row). Only the final bar, closed out after the loop, is allowed to end in newline.
 $capturedProgressRows = @(
-    $downloadOutput -split "`r?`n" |
-        Where-Object { $_ -match '^\[download\]\s+\d+(?:\.\d+)?%' }
+    [regex]::Matches($combinedOutput, "\[download\]\s+\d+(?:\.\d+)?%[^`r`n]*`r?`n")
 )
-$carriageReturnUpdates = [regex]::Matches($terminalOutput, "`r\[download\]\s+\d+(?:\.\d+)?%").Count
-Assert-True -Condition ($downloadOutput -match '(?m)^ARGS:.*--js-runtimes\s+node(?:\s|$)') -Message 'download enables the installed Node.js runtime for YouTube extraction'
-Assert-True -Condition ($downloadOutput -match '(?m)^ARGS:.*--progress(?:\s|$)') -Message 'download explicitly restores yt-dlp progress output'
-Assert-True -Condition ($downloadOutput -match '(?m)^ARGS:.*--newline(?:\s|$)') -Message 'download emits line-oriented progress through the PowerShell pipeline'
+$carriageReturnUpdates = [regex]::Matches($terminalOutput, "`r(?:Item \d+/\d+ \| )?\[download\]\s+\d+(?:\.\d+)?%").Count
+Assert-True -Condition ($combinedOutput -match '(?m)^ARGS:.*--js-runtimes"?\s+"?node"?(?:\s|$)') -Message 'download enables the installed Node.js runtime for YouTube extraction'
+Assert-True -Condition ($combinedOutput -match '(?m)^ARGS:.*--progress"?(?:\s|$)') -Message 'download explicitly restores yt-dlp progress output'
+Assert-True -Condition ($combinedOutput -match '(?m)^ARGS:.*--newline"?(?:\s|$)') -Message 'download emits line-oriented progress through the PowerShell pipeline'
 Assert-True -Condition ($capturedProgressRows.Count -le 1) -Message 'progress refreshes do not create newline-separated terminal spam'
 Assert-True -Condition ($carriageReturnUpdates -ge 2) -Message 'progress refreshes overwrite one terminal status line'
-Assert-True -Condition ($downloadOutput -notmatch 'Could not update download history') -Message 'successful download records history without a Generic.List conversion error'
+Assert-True -Condition ($terminalOutput -match 'Item 2/2') -Message 'playlist position counter is folded into the pinned progress bar'
+Assert-True -Condition ($combinedOutput -notmatch 'Downloading item') -Message 'the playlist item line is pinned to the bar, not scrolled as its own row'
+Assert-True -Condition (([regex]::Matches($combinedOutput, 'Saved: ').Count) -ge 2) -Message 'every playlist item reports a Saved line above the pinned bar'
+Assert-True -Condition ($combinedOutput -notmatch 'Could not update download history') -Message 'successful download records history without a Generic.List conversion error'
 Assert-True -Condition (Test-Path -LiteralPath $script:HistoryPath -PathType Leaf) -Message 'successful download creates the history CSV'
-Assert-True -Condition ($downloadOutput -notmatch 'height<=') -Message 'best-quality video download does not add a resolution ceiling'
+Assert-True -Condition ($combinedOutput -notmatch 'height<=') -Message 'best-quality video download does not add a resolution ceiling'
 Assert-True -Condition ($null -ne (Get-Command Read-VideoQuality -ErrorAction SilentlyContinue)) -Message 'video quality picker is available'
 Assert-True -Condition ($null -ne $script:JsRuntime) -Message 'a JavaScript runtime (node or deno) is detected'
 Assert-True -Condition ($null -ne (Get-Command Install-NodeRuntime -ErrorAction SilentlyContinue)) -Message 'node auto-install helper is available'
@@ -121,9 +132,17 @@ $manyLaunch = Get-ExplorerLaunch -Files $manyFiles -TargetFolder $testRoot
 Assert-True -Condition ($manyLaunch -eq ('"{0}"' -f $testRoot)) -Message 'multiple completed files open the download folder'
 $emptyLaunch = Get-ExplorerLaunch -Files @() -TargetFolder $testRoot
 Assert-True -Condition ($emptyLaunch -eq ('"{0}"' -f $testRoot)) -Message 'no completed files open the download folder'
+
+# Explorer window reuse: match an already-open folder ignoring trailing slash and case.
+Assert-True -Condition (Test-ExplorerPathMatch -WindowPath 'C:\Users\me\Downloads' -TargetFolder 'C:\Users\me\Downloads') -Message 'identical folder paths match'
+Assert-True -Condition (Test-ExplorerPathMatch -WindowPath 'C:\Users\me\Downloads\' -TargetFolder 'C:\Users\me\Downloads') -Message 'a trailing slash does not defeat the match'
+Assert-True -Condition (Test-ExplorerPathMatch -WindowPath 'C:\Users\ME\DOWNLOADS' -TargetFolder 'c:\users\me\downloads') -Message 'folder matching is case-insensitive'
+Assert-True -Condition (-not (Test-ExplorerPathMatch -WindowPath 'C:\Users\me\Music' -TargetFolder 'C:\Users\me\Downloads')) -Message 'different folders do not match'
+Assert-True -Condition (-not (Test-ExplorerPathMatch -WindowPath '' -TargetFolder 'C:\Users\me\Downloads')) -Message 'an empty window path never matches'
+Assert-True -Condition (-not (Test-ExplorerPathMatch -WindowPath 'C:\Users\me\Downloads' -TargetFolder '')) -Message 'an empty target folder never matches'
 Assert-True -Condition ($null -ne (Get-Command Show-SettingsMenu -ErrorAction SilentlyContinue)) -Message 'settings menu screen is available'
 
-$startupOutput = @('6') | & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $downloaderPath 2>&1 | Out-String
+$startupOutput = @('7') | & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $downloaderPath 2>&1 | Out-String
 $startupExitCode = $LASTEXITCODE
 Assert-True -Condition ($startupExitCode -eq 0) -Message 'redirected/non-interactive startup exits cleanly'
 Assert-True -Condition ($startupOutput -notmatch 'CursorPosition') -Message 'redirected startup does not fail while clearing the screen'

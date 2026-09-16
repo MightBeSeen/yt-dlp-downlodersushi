@@ -4,15 +4,27 @@
 
 HOW TO RUN
 ----------
+NEW PC: double-click "Install Seen Downloader.cmd". Setup downloads the latest
+app and all helpers, adds shortcuts, and opens the downloader. No admin needed.
+Requires internet and Windows 10/11 on an Intel/AMD 64-bit PC.
+Installed location: %LOCALAPPDATA%\Seen Downloader
+Close the downloader and rerun the installer to update. Your data is kept.
+
+ALREADY HAVE A PORTABLE COPY:
 1. Keep ALL the files in this folder together (don't move just one out).
 2. Double-click:  Seen's yt-dlp Downloader.cmd
-3. Follow the on-screen menu. That's it.
+3. Follow the on-screen menu. Review your choices and destination before starting.
+   Choose "Change choices" to edit them, or cancel without starting a download.
+   Arrow keys and Enter select options; small terminals use numbered prompts.
+4. For several links, choose menu option 2, "Download queue". Add links, then
+   start the queue. It runs one at a time. Closing the app clears the queue.
+   Ctrl+C stops processing; failed or interrupted items can be retried.
 
 
-FIRST RUN: IT SETS ITSELF UP
+WHEN DOWNLOADING: IT OFFERS SETUP
 ----------------------------
 The tool needs two free helpers. If either is missing, it will OFFER TO
-INSTALL THEM FOR YOU when you start it - just answer "Y":
+INSTALL THEM FOR YOU when you start a download - just answer "Y":
 
   * Node.js  -> installed automatically via winget (needed for YouTube).
                You may see a Windows "Do you want to allow..." (UAC) box.
@@ -20,7 +32,9 @@ INSTALL THEM FOR YOU when you start it - just answer "Y":
 
   * FFmpeg   -> downloaded straight into this folder (about 80 MB, no install).
                Only needed for MP3/AAC audio and best-quality video merges.
-               If you skip it, video downloads still work fine.
+               If you skip setup, you return to the main menu.
+
+Library, history, and settings work without installing these helpers.
 
 You don't have to install anything by hand. If for some reason the automatic
 setup can't run, the tool tells you exactly what to get and where.
@@ -33,9 +47,12 @@ Into a "Downloads" folder that appears next to the .cmd, sorted by date.
 
 TROUBLESHOOTING
 ---------------
+- Video details aren't ready? Choose live/playlist handling manually; no wait needed.
+- Damaged history? Valid records still display, with a count of skipped rows.
+  Your original history file is preserved.
 - Node install needs "winget" (built into Windows 10/11). If it's missing,
   get Node.js manually from https://nodejs.org/ (the "LTS" installer).
-- A site suddenly stopped working -> open the tool and choose menu option 4,
+- A site suddenly stopped working -> open the tool and choose menu option 5,
   "Update downloader engine".
 
 Enjoy!
