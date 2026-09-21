@@ -11,10 +11,61 @@ $script:Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:YtDlp = Join-Path $script:Root 'yt-dlp.exe'
 $script:GalleryDl = Join-Path $script:Root 'gallery-dl.exe'
 
+# Source repository for in-app self-update. The updater reads the latest commit on
+# $script:RepoBranch and refreshes just these app files (not the engine binaries,
+# which have their own update paths). Kept in sync with the network installer's list.
+$script:RepoOwnerName = 'MightBeSeen/yt-dlp-downlodersushi'
+$script:RepoBranch    = 'main'
+$script:AppFiles      = @('smart-downloader.ps1', "Seen's yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt')
+
 # Make helpers that live beside the script (e.g. a downloaded ffmpeg.exe) discoverable to
 # both this process and the yt-dlp child process, without touching the system PATH.
 if (($env:PATH -split ';') -notcontains $script:Root) {
     $env:PATH = $script:Root + ';' + $env:PATH
+}
+
+# Force TLS 1.2 so engine downloads succeed on older Windows 10 / PowerShell 5.1,
+# where the default security protocol can still be TLS 1.0 and HTTPS hosts (GitHub,
+# Codeberg, gyan.dev) refuse the connection.
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
+
+# Download a file with retries, a timeout, and an empty-response guard so a transient
+# network hiccup does not abort an engine install. Every self-installer (gallery-dl,
+# FFmpeg, and any engine added in a future update) downloads through this one helper,
+# so new engines inherit the same reliability without repeating the logic. Throws on
+# the final failed attempt; callers wrap it in their own try/catch.
+function Invoke-ReliableDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [int]$Attempts = 3,
+        [int]$TimeoutSec = 300,
+        [hashtable]$Headers = @{}
+    )
+    $previousProgress = $ProgressPreference
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination -TimeoutSec $TimeoutSec -Headers $Headers
+                if ((Get-Item -LiteralPath $Destination).Length -eq 0) { throw 'The server returned an empty file.' }
+                return $true
+            } catch {
+                if (Test-Path -LiteralPath $Destination) {
+                    Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+                }
+                if ($attempt -eq $Attempts) { throw }
+                Write-Host ('  Download interrupted; retrying ({0}/{1})...' -f $attempt, $Attempts) -ForegroundColor Yellow
+                Start-Sleep -Seconds 2
+            }
+        }
+    } finally {
+        $ProgressPreference = $previousProgress
+    }
+    return $false
 }
 
 function Test-CommandAvailable {
@@ -1886,9 +1937,130 @@ function Show-DownloadHistory {
     }
 }
 
+# Read the installed GitHub revision recorded by a prior update/install. Returns the
+# 40-char commit SHA, or $null when the file is missing or malformed. Mirrors the
+# revision-parsing half of Get-AppVersion.
+function Get-InstalledRevision {
+    $verFile = Join-Path $script:Root 'installed-version.txt'
+    if (-not (Test-Path -LiteralPath $verFile -PathType Leaf)) { return $null }
+    try {
+        $sha = (Get-Content -LiteralPath $verFile -Raw).Trim()
+        if ($sha -match '^[0-9a-f]{40}$') { return $sha }
+    } catch { }
+    return $null
+}
+
+# Copy staged app files over the live ones with all-or-nothing rollback: each existing
+# file is backed up first, and if any copy fails every file already swapped is restored
+# before the error is rethrown. Ported from the network installer's Install-SetupFiles.
+function Install-AppFiles {
+    param(
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$Target,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+    $backup = Join-Path $Stage 'backup'
+    New-Item -ItemType Directory -Path $backup -Force | Out-Null
+    $changed = @()
+    try {
+        foreach ($name in $Names) {
+            $destination = Join-Path $Target $name
+            $existed = Test-Path -LiteralPath $destination
+            if ($existed) { Copy-Item -LiteralPath $destination -Destination (Join-Path $backup $name) -Force }
+            $changed += [pscustomobject]@{ Name = $name; Existed = $existed }
+            Copy-Item -LiteralPath (Join-Path $Stage $name) -Destination $destination -Force
+        }
+    } catch {
+        $originalError = $_
+        foreach ($item in $changed) {
+            $destination = Join-Path $Target $item.Name
+            try {
+                if ($item.Existed) {
+                    Copy-Item -LiteralPath (Join-Path $backup $item.Name) -Destination $destination -Force
+                } elseif (Test-Path -LiteralPath $destination) {
+                    Remove-Item -LiteralPath $destination -Force
+                }
+            } catch { Write-Host ('  Could not restore {0}. Close the downloader and run the installer.' -f $destination) -ForegroundColor Yellow }
+        }
+        throw $originalError
+    }
+}
+
+# Pull the newest app source files from the GitHub repo and swap them in place. Only the
+# app scripts/docs are updated (engine binaries self-update separately). Any network or
+# validation failure leaves every file untouched and returns without throwing, so the
+# engine-update steps that follow this call still run.
+function Update-AppFromGitHub {
+    Write-Host 'Checking GitHub for a newer app version...' -ForegroundColor DarkGray
+
+    # One rate-limited API call to resolve the latest commit; the repo is public so no
+    # token is required, but honor GITHUB_TOKEN when present (e.g. to raise the limit).
+    $headers = @{ 'User-Agent' = 'Seen-Downloader' }
+    if ($env:GITHUB_TOKEN) { $headers['Authorization'] = 'Bearer ' + $env:GITHUB_TOKEN }
+    $sha = $null
+    try {
+        $commitApi = 'https://api.github.com/repos/{0}/commits/{1}' -f $script:RepoOwnerName, $script:RepoBranch
+        $sha = (Invoke-RestMethod -Uri $commitApi -Headers $headers -TimeoutSec 30).sha
+    } catch {
+        Write-Host ('Could not reach GitHub to check for updates: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+        Write-Host 'Skipping the app update; the engine updates below will still run.' -ForegroundColor DarkGray
+        return
+    }
+    if ([string]$sha -notmatch '^[0-9a-f]{40}$') {
+        Write-Host 'GitHub returned an unexpected revision; skipping the app update.' -ForegroundColor Yellow
+        return
+    }
+
+    $installed = Get-InstalledRevision
+    if ($installed -eq $sha) {
+        Write-Host ('The app is already up to date (rev {0}).' -f $sha.Substring(0, 7)) -ForegroundColor Green
+        return
+    }
+
+    Write-Host ('A newer app version is available (rev {0}). Downloading...' -f $sha.Substring(0, 7)) -ForegroundColor Cyan
+    $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('seen-app-{0}' -f ([guid]::NewGuid().ToString('N')))
+    try {
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+        # Fetch each app file from raw.githubusercontent pinned to the exact commit. This
+        # avoids the GitHub API rate limit for file content and needs no Accept header.
+        foreach ($name in $script:AppFiles) {
+            $encoded = ($name -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+            $url = 'https://raw.githubusercontent.com/{0}/{1}/{2}' -f $script:RepoOwnerName, $sha, $encoded
+            Write-Host ('  Downloading {0}...' -f $name) -ForegroundColor DarkGray
+            [void](Invoke-ReliableDownload -Url $url -Destination (Join-Path $stage $name))
+        }
+
+        # Refuse to swap in a script that would not parse - guards against a truncated or
+        # corrupted download bricking the app on next launch.
+        $tokens = $null
+        $parseErrors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $stage 'smart-downloader.ps1'), [ref]$tokens, [ref]$parseErrors)
+        if ($parseErrors.Count) {
+            Write-Host 'The downloaded app failed a syntax check; keeping the current version.' -ForegroundColor Red
+            return
+        }
+
+        Install-AppFiles -Stage $stage -Target $script:Root -Names $script:AppFiles
+        Set-Content -LiteralPath (Join-Path $script:Root 'installed-version.txt') -Value $sha -Encoding ASCII
+
+        Write-Host ('App updated to rev {0}. Close and reopen the downloader to run the new version.' -f $sha.Substring(0, 7)) -ForegroundColor Green
+    } catch {
+        Write-Host ('App update failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        Write-Host 'The current app files were left unchanged.' -ForegroundColor DarkGray
+    } finally {
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Update-DownloaderEngine {
     Clear-Terminal
-    Write-Heading -Text 'Update downloader engines'
+    Write-Heading -Text 'Update this app + downloader engines'
+
+    # The app updates itself from GitHub first, then the engines update below.
+    Write-Host 'App:' -ForegroundColor Cyan
+    Update-AppFromGitHub
+    Write-Host ''
 
     # yt-dlp updates itself in place via its own -U command.
     Write-Host 'yt-dlp:' -ForegroundColor Cyan
@@ -2090,37 +2262,103 @@ function Show-BlockedPlatformsMenu {
     }
 }
 
+# Download the official Node.js LTS zip and drop node.exe beside the script. Needs no
+# winget, no admin/UAC, and no system install - the app folder is already on this
+# process's PATH. Verifies the download against the published SHASUMS256. Returns $true
+# when node is usable afterward. Ported from the network installer's Node logic.
+function Install-NodePortable {
+    $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('node-{0}' -f ([guid]::NewGuid().ToString('N')))
+    try {
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+        Write-Host 'Finding the latest Node.js LTS...' -ForegroundColor DarkGray
+        $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -TimeoutSec 30
+        $node = $index | Where-Object { $_.lts -and ($_.files -contains 'win-x64-zip') } | Select-Object -First 1
+        if (-not $node -or $node.version -notmatch '^v\d+\.\d+\.\d+$') {
+            Write-Host 'No supported Node.js LTS release was found.' -ForegroundColor Red
+            return $false
+        }
+
+        $nodeName = 'node-{0}-win-x64.zip' -f $node.version
+        $nodeBase = 'https://nodejs.org/dist/{0}' -f $node.version
+        $zipPath  = Join-Path $stage $nodeName
+        $sumsPath = Join-Path $stage 'SHASUMS256.txt'
+
+        Write-Host ('Downloading Node.js {0} (about 30 MB)...' -f $node.version) -ForegroundColor DarkGray
+        [void](Invoke-ReliableDownload -Url ('{0}/{1}' -f $nodeBase, $nodeName) -Destination $zipPath)
+        [void](Invoke-ReliableDownload -Url ('{0}/SHASUMS256.txt' -f $nodeBase) -Destination $sumsPath)
+
+        # Verify the zip against the published checksum before trusting it.
+        $checksums = Get-Content -LiteralPath $sumsPath -Raw
+        $pattern = '(?im)^([a-f0-9]{64})\s+\*?' + [regex]::Escape($nodeName) + '\s*$'
+        $match = [regex]::Match($checksums, $pattern)
+        if (-not $match.Success) {
+            Write-Host 'No checksum was published for the Node.js download.' -ForegroundColor Red
+            return $false
+        }
+        $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+        if ($actual -ne $match.Groups[1].Value.ToUpperInvariant()) {
+            Write-Host 'The Node.js download failed SHA-256 verification; discarding it.' -ForegroundColor Red
+            return $false
+        }
+        Write-Host 'SHA-256 verified.' -ForegroundColor DarkGray
+
+        Write-Host 'Extracting Node.js...' -ForegroundColor DarkGray
+        Expand-Archive -LiteralPath $zipPath -DestinationPath (Join-Path $stage 'unzipped') -Force
+        $nodeExe = Get-ChildItem -LiteralPath (Join-Path $stage 'unzipped') -Recurse -File -Filter 'node.exe' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -eq $nodeExe) {
+            Write-Host 'The Node.js archive did not contain node.exe.' -ForegroundColor Red
+            return $false
+        }
+        Copy-Item -LiteralPath $nodeExe.FullName -Destination (Join-Path $script:Root 'node.exe') -Force
+
+        # node.exe now lives beside the script, which is already on this process's PATH
+        # (set at startup). Refresh the runtime state so yt-dlp uses it immediately.
+        Update-JsRuntimeState
+        return (Test-CommandAvailable -Name 'node')
+    } catch {
+        Write-Host ('Portable Node.js download failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        return $false
+    } finally {
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Install-NodeRuntime {
     Write-Host ''
-    Write-Host 'Node.js can be installed automatically with winget (Windows Package Manager).' -ForegroundColor Cyan
+    Write-Host 'Node.js can be installed automatically (winget, or a portable download if winget is unavailable).' -ForegroundColor Cyan
     $answer = (Read-Host 'Install Node.js now? [Y]es / [N]o').Trim().ToUpperInvariant()
     if ($answer -notin @('', 'Y', 'YES')) {
         return $false
     }
 
-    if (-not (Test-CommandAvailable -Name 'winget')) {
-        Write-Host 'winget is not available on this PC.' -ForegroundColor Yellow
-        Write-Host 'Install Node.js manually from https://nodejs.org/ (get the LTS installer), then run this again.' -ForegroundColor Yellow
-        return $false
+    # Preferred path: winget installs Node system-wide. If winget is missing or the
+    # install does not yield a working node, fall back to a portable download.
+    if (Test-CommandAvailable -Name 'winget') {
+        Write-Host 'Installing Node.js LTS with winget. You may see a Windows security (UAC) prompt - choose Yes.' -ForegroundColor DarkGray
+        Write-Host ''
+        try {
+            & winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements 2>&1 |
+                ForEach-Object { Write-Host ([string]$_) }
+
+            # winget installs Node to its default location, but the new PATH entry is not
+            # visible to this already-running process. Add the default folder to use it now.
+            $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
+            if ((Test-Path -LiteralPath (Join-Path $nodeDir 'node.exe')) -and (($env:PATH -split ';') -notcontains $nodeDir)) {
+                $env:PATH = $nodeDir + ';' + $env:PATH
+            }
+            if (Test-CommandAvailable -Name 'node') { return $true }
+            Write-Host 'winget did not produce a working Node.js; trying a portable download instead.' -ForegroundColor Yellow
+        } catch {
+            Write-Host ('winget install failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+            Write-Host 'Trying a portable Node.js download instead...' -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host 'winget is not available on this PC; downloading a portable Node.js instead.' -ForegroundColor DarkGray
     }
 
-    Write-Host 'Installing Node.js LTS. You may see a Windows security (UAC) prompt - choose Yes.' -ForegroundColor DarkGray
-    Write-Host ''
-    try {
-        & winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements 2>&1 |
-            ForEach-Object { Write-Host ([string]$_) }
-    } catch {
-        Write-Host ('Node.js installation failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
-        return $false
-    }
-
-    # winget installs Node to its default location, but the new PATH entry is not visible to
-    # this already-running process. Add the default folder so we can use it immediately.
-    $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
-    if ((Test-Path -LiteralPath (Join-Path $nodeDir 'node.exe')) -and (($env:PATH -split ';') -notcontains $nodeDir)) {
-        $env:PATH = $nodeDir + ';' + $env:PATH
-    }
-    return (Test-CommandAvailable -Name 'node')
+    return (Install-NodePortable)
 }
 
 function Install-FfmpegLocal {
@@ -2135,13 +2373,9 @@ function Install-FfmpegLocal {
     $tempZip = Join-Path ([System.IO.Path]::GetTempPath()) ('ffmpeg-{0}.zip' -f ([guid]::NewGuid().ToString('N')))
     $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ffmpeg-{0}' -f ([guid]::NewGuid().ToString('N')))
     $succeeded = $false
-    $previousProgress = $ProgressPreference
     try {
         Write-Host 'Downloading FFmpeg...' -ForegroundColor DarkGray
-        $previousProgress = $ProgressPreference
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $url -OutFile $tempZip -UseBasicParsing
-        $ProgressPreference = $previousProgress
+        [void](Invoke-ReliableDownload -Url $url -Destination $tempZip)
         Write-Host 'Extracting FFmpeg...' -ForegroundColor DarkGray
         Expand-Archive -LiteralPath $tempZip -DestinationPath $tempDir -Force
         foreach ($name in @('ffmpeg.exe', 'ffprobe.exe')) {
@@ -2155,7 +2389,6 @@ function Install-FfmpegLocal {
     } catch {
         Write-Host ('FFmpeg download failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
     } finally {
-        $ProgressPreference = $previousProgress
         if (Test-Path -LiteralPath $tempZip) { Remove-Item -LiteralPath $tempZip -Force -ErrorAction SilentlyContinue }
         if (Test-Path -LiteralPath $tempDir) { Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
@@ -2309,12 +2542,9 @@ function Install-GalleryDl {
     $release = Get-GalleryDlRelease
     $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('gallery-dl-{0}.exe' -f ([guid]::NewGuid().ToString('N')))
     $succeeded = $false
-    $previousProgress = $ProgressPreference
     try {
         Write-Host ('Downloading gallery-dl {0}...' -f $release.Version) -ForegroundColor DarkGray
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $release.Url -OutFile $temp -UseBasicParsing
-        $ProgressPreference = $previousProgress
+        [void](Invoke-ReliableDownload -Url $release.Url -Destination $temp)
 
         $hash = (Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToLowerInvariant()
         if (-not [string]::IsNullOrWhiteSpace($release.Sha256)) {
@@ -2340,7 +2570,6 @@ function Install-GalleryDl {
     } catch {
         Write-Host ('gallery-dl download failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
     } finally {
-        $ProgressPreference = $previousProgress
         if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
     }
     return $succeeded
@@ -2901,7 +3130,7 @@ function Show-MainMenu {
     Write-Host '  2. Download queue'
     Write-Host '  3. View media library sizes'
     Write-Host '  4. View recorded download history'
-    Write-Host '  5. Update downloader engines (yt-dlp + gallery-dl)'
+    Write-Host '  5. Update this app + downloader engines (from GitHub)'
     Write-Host '  6. Settings'
     Write-Host '  7. Exit'
     Write-Host ''

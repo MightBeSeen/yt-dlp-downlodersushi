@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-09-21 — In-app self-update + winget-free Node.js
+
+- **The app can now update itself.** Menu option 5 ("Update this app + downloader engines")
+  first checks the app's own GitHub repo (`MightBeSeen/yt-dlp-downlodersushi`, branch `main`)
+  and, when a newer commit exists, downloads the app files, syntax-checks the new script,
+  backs up the current ones, and swaps them in atomically (with rollback on any failure),
+  then records the commit in `installed-version.txt`. Any network/validation failure leaves
+  every file untouched and the engine updates below still run. Reuses the network installer's
+  proven staging/backup pattern; only app source files are touched (engine binaries keep
+  their own update paths). New: `Update-AppFromGitHub`, `Install-AppFiles`,
+  `Get-InstalledRevision`; `Invoke-ReliableDownload` gained an optional `-Headers` param.
+- **Node.js install no longer requires winget.** `Install-NodeRuntime` still prefers winget,
+  but now falls back to a portable download (`Install-NodePortable`): the official Node LTS
+  zip is fetched from nodejs.org, SHA-256 verified against the published `SHASUMS256.txt`, and
+  `node.exe` is dropped beside the app (no admin/UAC). Works on locked-down PCs without winget.
+
 ## 2026-09-21 — Automatic social routing and simpler folders
 
 - Fixed the mode prompt for X photo links: mode selection previously ignored the URL.
