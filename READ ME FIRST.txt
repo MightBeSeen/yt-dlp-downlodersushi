@@ -9,6 +9,15 @@ app and all helpers, adds shortcuts, and opens the downloader. No admin needed.
 Requires internet and Windows 10/11 on an Intel/AMD 64-bit PC.
 Installed location: %LOCALAPPDATA%\Seen Downloader
 Close the downloader and rerun the installer to update. Your data is kept.
+The app also checks for updates when opened. Choose Update now or Later.
+Menu option 5 updates/repairs the app and all download helpers together.
+Unchanged verified helpers are reused. Updates restart the app.
+If you have an older app, use its Update option once and then reopen it.
+Setup shows downloaded MB while working. FFmpeg is the largest download;
+the "Step 3/6 complete" line does not mean its download is stuck at 50%.
+If a connection stalls, setup retries or switches the FFmpeg download source.
+If setup cannot finish, rerun it later. Error details are saved in:
+  %LOCALAPPDATA%\Seen Downloader\logs\setup-*.log
 
 ALREADY HAVE A PORTABLE COPY:
 1. Keep ALL the files in this folder together (don't move just one out).
@@ -21,16 +30,16 @@ ALREADY HAVE A PORTABLE COPY:
    Ctrl+C stops processing; failed or interrupted items can be retried.
 
 
-WHEN DOWNLOADING: IT OFFERS SETUP
+PORTABLE COPIES WITH MISSING HELPERS
 ----------------------------
-The tool needs two free helpers. If either is missing, it will OFFER TO
+The fresh-PC installer includes every helper; no separate setup is needed.
+For an older portable copy, the app needs two helpers. If either is missing, it will OFFER TO
 INSTALL THEM FOR YOU when you start a download - just answer "Y":
 
-  * Node.js  -> installed automatically via winget (needed for YouTube).
-               You may see a Windows "Do you want to allow..." (UAC) box.
-               Click YES. If it asks you to reopen the tool afterward, do that.
+  * Node.js  -> downloaded beside the app, with checksum verification.
+               Needed for YouTube. No administrator access is needed.
 
-  * FFmpeg   -> downloaded straight into this folder (about 80 MB, no install).
+  * FFmpeg   -> downloaded straight into this folder (about 110 MB, no install).
                Only needed for MP3/AAC audio and best-quality video merges.
                If you skip setup, you return to the main menu.
 
@@ -50,9 +59,10 @@ TROUBLESHOOTING
 - Video details aren't ready? Choose live/playlist handling manually; no wait needed.
 - Damaged history? Valid records still display, with a count of skipped rows.
   Your original history file is preserved.
-- Node install needs "winget" (built into Windows 10/11). If it's missing,
-  get Node.js manually from https://nodejs.org/ (the "LTS" installer).
+- Setup fails? Check your internet connection and run the installer again.
+  If it keeps failing, share the latest setup log from the folder above.
+  Node.js, FFmpeg, Python, winget, and PowerShell 7 do not need to be preinstalled.
 - A site suddenly stopped working -> open the tool and choose menu option 5,
-  "Update downloader engine".
+  "Update / repair app and download helpers".
 
 Enjoy!

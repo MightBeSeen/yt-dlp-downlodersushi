@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-09-21 — Tested updates and project audit
+
+- Added startup update offers (Update now / Later), a settings toggle, and automatic
+  relaunch after successful updates. Checks are bounded to three seconds.
+- In-app update/repair runs the checked commit's standalone installer in a fresh
+  process. It now updates all five helpers without using stale loaded release logic.
+- Moved shared download/checksum/rollback code into one source embedded in both
+  standalone deliverables; old four-file updaters can still install the new app.
+- Reuse unchanged verified helper packages; reject changed files and re-test binaries.
+  gallery-dl now has a pinned SHA256. Node setup no longer needs winget or UAC.
+- Fixed app/revision transaction rollback, concurrent setup protection, host-only
+  HttpOnly cookie filtering, active-session cookie cleanup, and atomic settings writes.
+- Added Windows PowerShell 5.1 / PowerShell 7 CI. Passing main commits advance the
+  stable branch used by new installers and startup checks; failures are not published.
+- Replaced the minimal README with install/update instructions, added a project map
+  and publishing guide, and stopped tracking downloaded helper binaries.
+
+## 2026-09-21 — Reliable fresh-PC installer
+
+- Replaced silent whole-file requests with streamed downloads showing transferred MB
+  every two seconds. Stalled connections stop after 45 seconds without data; healthy
+  slow transfers can run for up to 30 minutes per attempt, instead of five minutes.
+- FFmpeg uses the publisher's versioned GitHub ZIP and SHA256 digest, with a separately
+  verified gyan.dev fallback. A gyan.dev outage no longer blocks the only source.
+- Setup steps print on separate lines and no longer masquerade as download percentages.
+  Extraction is announced; errors identify the file/server and are saved in setup logs.
+- Partial downloads are removed on failure. Helper version checks have a 30-second
+  deadline. Setup releases its lock and staging folder before launching the app.
+- Added real local HTTP regression tests for slow, stalled, truncated, and failed
+  downloads, plus source fallback, integrity, cleanup, and helper-timeout coverage.
+
 ## 2026-09-21 — In-app self-update + winget-free Node.js
 
 - **The app can now update itself.** Menu option 5 ("Update this app + downloader engines")

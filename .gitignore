@@ -43,3 +43,11 @@ cookies*.txt
 
 # Downloaded helper binary (fetched from Codeberg by the installer/app, not stored in the repo)
 /gallery-dl.exe
+/yt-dlp.exe
+/node.exe
+/ffmpeg.exe
+/ffprobe.exe
+/*-LICENSE.txt
+/installed-helpers.json
+/.setup-*/
+/.claude/settings.local.json

@@ -1,5 +1,5 @@
-﻿[CmdletBinding()]
-param()
+[CmdletBinding()]
+param([switch]$NoUpdateCheck)
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -15,8 +15,9 @@ $script:GalleryDl = Join-Path $script:Root 'gallery-dl.exe'
 # $script:RepoBranch and refreshes just these app files (not the engine binaries,
 # which have their own update paths). Kept in sync with the network installer's list.
 $script:RepoOwnerName = 'MightBeSeen/yt-dlp-downlodersushi'
-$script:RepoBranch    = 'main'
-$script:AppFiles      = @('smart-downloader.ps1', "Seen's yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt')
+$script:RepoBranch    = 'stable'
+$script:AppFiles      = @('smart-downloader.ps1', "Seen's yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt', 'Install Seen Downloader.cmd')
+$script:RestartRequested = $false
 
 # Make helpers that live beside the script (e.g. a downloaded ffmpeg.exe) discoverable to
 # both this process and the yt-dlp child process, without touching the system PATH.
@@ -37,35 +38,253 @@ try {
 # FFmpeg, and any engine added in a future update) downloads through this one helper,
 # so new engines inherit the same reliability without repeating the logic. Throws on
 # the final failed attempt; callers wrap it in their own try/catch.
+# BEGIN GENERATED UPDATE CORE - edit lib/update-core.ps1, then run scripts/Sync-UpdateCore.ps1
+# Shared installation/update workers. Embedded in both deliverables for legacy upgrades.
+
+function Write-Step {
+    param([string]$Marker, [string]$Message)
+    Write-Host ('  [{0}] {1}' -f $Marker, $Message)
+}
+
+function Invoke-SetupTransfer {
+    param([string]$Url, [string]$Destination, [hashtable]$Headers = @{},
+        [int]$IdleTimeoutSec = 45, [int]$TimeoutSec = 1800)
+    Add-Type -AssemblyName System.Net.Http
+    $client = New-Object Net.Http.HttpClient
+    $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
+    $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Url)
+    $cancel = New-Object Threading.CancellationTokenSource
+    $response = $null; $inputStream = $null; $outputStream = $null
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $idle = [Diagnostics.Stopwatch]::StartNew()
+    $display = [Diagnostics.Stopwatch]::StartNew()
+    [long]$received = 0
+    [long]$total = 0
+    $label = Split-Path -Leaf $Destination
+    $wait = {
+        param($Task)
+        do {
+            if ($clock.Elapsed.TotalSeconds -ge $TimeoutSec) { throw "Download exceeded $TimeoutSec seconds." }
+            if ($idle.Elapsed.TotalSeconds -ge $IdleTimeoutSec) { throw "No download data received for $IdleTimeoutSec seconds." }
+            if ($display.Elapsed.TotalSeconds -ge 2) {
+                $size = '{0:N1} MB' -f ($received / 1MB)
+                if ($total -gt 0) { $size += ' / {0:N1} MB ({1:N0}%)' -f ($total / 1MB), (100 * $received / $total) }
+                Write-Step '*' ('{0}: {1}, {2:N0}s elapsed' -f $label, $size, $clock.Elapsed.TotalSeconds)
+                $display.Restart()
+            }
+            if ($Task.IsCompleted) { break }
+            [void]$Task.Wait(100)
+        } while ($true)
+    }
+    try {
+        foreach ($key in $Headers.Keys) { [void]$request.Headers.TryAddWithoutValidation($key, [string]$Headers[$key]) }
+        if (-not $request.Headers.UserAgent.ToString()) { [void]$request.Headers.TryAddWithoutValidation('User-Agent', 'Seen-Downloader-Setup') }
+        Write-Step '*' ("Connecting to {0} for {1}..." -f ([uri]$Url).Host, $label)
+        $task = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cancel.Token)
+        & $wait $task
+        $response = $task.GetAwaiter().GetResult()
+        [void]$response.EnsureSuccessStatusCode()
+        if ($null -ne $response.Content.Headers.ContentLength) { $total = $response.Content.Headers.ContentLength }
+        $task = $response.Content.ReadAsStreamAsync()
+        & $wait $task
+        $inputStream = $task.GetAwaiter().GetResult()
+        $outputStream = [IO.File]::Create($Destination)
+        $buffer = New-Object byte[] 65536
+        while ($true) {
+            $task = $inputStream.ReadAsync($buffer, 0, $buffer.Length, $cancel.Token)
+            & $wait $task
+            $count = $task.GetAwaiter().GetResult()
+            if ($count -eq 0) { break }
+            $outputStream.Write($buffer, 0, $count)
+            $received += $count
+            $idle.Restart()
+        }
+        if ($received -eq 0) { throw 'The server returned an empty file.' }
+        if ($total -gt 0 -and $received -ne $total) { throw 'The download ended before the complete file arrived.' }
+        Write-Step 'ok' ('{0}: {1:N1} MB downloaded.' -f $label, ($received / 1MB))
+    } finally {
+        $cancel.Cancel()
+        if ($outputStream) { $outputStream.Dispose() }
+        if ($inputStream) { $inputStream.Dispose() }
+        if ($response) { $response.Dispose() }
+        $request.Dispose()
+        $client.Dispose()
+        $cancel.Dispose()
+    }
+}
+
+function Get-SetupFile {
+    param([string]$Url, [string]$Destination, [hashtable]$Headers = @{},
+        [int]$Attempts = 3, [int]$IdleTimeoutSec = 45, [int]$TimeoutSec = 1800)
+    $partial = $Destination + '.part'
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Invoke-SetupTransfer $Url $partial $Headers -IdleTimeoutSec $IdleTimeoutSec -TimeoutSec $TimeoutSec
+            if ((Get-Item -LiteralPath $partial).Length -eq 0) { throw 'The server returned an empty file.' }
+            Move-Item -LiteralPath $partial -Destination $Destination -Force
+            return
+        } catch {
+            if ($attempt -eq $Attempts) { throw "Could not download $([IO.Path]::GetFileName($Destination)) from $(([uri]$Url).Host): $($_.Exception.Message)" }
+            Write-Step '!' ("Download attempt $attempt/$Attempts failed: $($_.Exception.Message) Retrying...")
+            Start-Sleep -Seconds 2
+        } finally {
+            if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force }
+        }
+    }
+}
+
+function Get-SetupFfmpeg {
+    param([string]$Stage, [string]$Target = '')
+    $zip = Join-Path $Stage 'ffmpeg.zip'
+    try {
+        Write-Step '*' 'Trying FFmpeg publisher on GitHub...'
+        $metadata = Join-Path $Stage 'ffmpeg-release.json'
+        Get-SetupFile 'https://api.github.com/repos/GyanD/codexffmpeg/releases/latest' $metadata -Attempts 1
+        $release = Get-Content -LiteralPath $metadata -Raw | ConvertFrom-Json
+        $assets = @($release.assets | Where-Object { $_.name -match '^ffmpeg-[0-9.]+-essentials_build\.zip$' })
+        if ($assets.Count -ne 1) { throw 'No unique FFmpeg essentials ZIP was published.' }
+        $asset = $assets[0]
+        if ($asset.digest -notmatch '^sha256:([a-fA-F0-9]{64})$') { throw 'The FFmpeg release has no SHA256 digest.' }
+        $hash = $Matches[1]
+        if ($Target -and (Copy-SetupCachedGroup $Target $Stage 'ffmpeg' $hash @('ffmpeg.exe', 'ffprobe.exe', 'FFmpeg-LICENSE.txt'))) {
+            Set-Content (Join-Path $Stage 'ffmpeg-key.txt') $hash -Encoding ASCII
+            return $true
+        }
+        if ($asset.browser_download_url -notlike 'https://github.com/GyanD/codexffmpeg/releases/download/*') { throw 'Unexpected FFmpeg release URL.' }
+        Get-SetupFile $asset.browser_download_url $zip -Attempts 1
+        Assert-SetupHash $zip "$hash  ffmpeg.zip" 'ffmpeg.zip'
+        Set-Content (Join-Path $Stage 'ffmpeg-key.txt') $hash -Encoding ASCII
+        return $false
+    } catch {
+        Write-Step '!' ("FFmpeg GitHub source failed: $($_.Exception.Message)")
+        Write-Step '*' 'Switching to the FFmpeg publisher at gyan.dev...'
+    }
+    $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+    Get-SetupFile "$url.sha256" (Join-Path $Stage 'ffmpeg-checksum.txt') -Attempts 1
+    $hash = ((Get-Content -LiteralPath (Join-Path $Stage 'ffmpeg-checksum.txt') -Raw).Trim() -split '\s+')[0]
+    if ($hash -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid FFmpeg checksum from gyan.dev.' }
+    if ($Target -and (Copy-SetupCachedGroup $Target $Stage 'ffmpeg' $hash @('ffmpeg.exe', 'ffprobe.exe', 'FFmpeg-LICENSE.txt'))) {
+        Set-Content (Join-Path $Stage 'ffmpeg-key.txt') $hash -Encoding ASCII
+        return $true
+    }
+    Get-SetupFile $url $zip -Attempts 1
+    Assert-SetupHash $zip "$hash  ffmpeg.zip" 'ffmpeg.zip'
+    Set-Content (Join-Path $Stage 'ffmpeg-key.txt') $hash -Encoding ASCII
+    return $false
+}
+
+function Assert-SetupHash {
+    param([string]$Path, [string]$Checksums, [string]$Name)
+    $pattern = '(?im)^([a-f0-9]{64})\s+\*?' + [regex]::Escape($Name) + '\s*$'
+    $match = [regex]::Match($Checksums, $pattern)
+    if (-not $match.Success) { throw "No SHA256 checksum was published for $Name." }
+    if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $match.Groups[1].Value) {
+        throw "Checksum mismatch for $Name. Run setup again to download a fresh copy."
+    }
+}
+
+function Test-SetupHelper {
+    param([string]$Path, [string]$Arguments = '--version', [int]$TimeoutSec = 30)
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $Path
+    $info.Arguments = $Arguments
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $info
+    $started = $false
+    try {
+        [void]$process.Start()
+        $started = $true
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSec * 1000)) { throw "$(Split-Path -Leaf $Path) did not respond within $TimeoutSec seconds. Close the app and rerun setup." }
+        if ($process.ExitCode -ne 0) { throw "$(Split-Path -Leaf $Path) could not run on this PC: $($stderr.GetAwaiter().GetResult())" }
+        $reported = $stdout.GetAwaiter().GetResult()
+        if (-not $reported.Trim()) { throw "$(Split-Path -Leaf $Path) returned no version information." }
+        Write-Step 'ok' ('{0}: {1}' -f (Split-Path -Leaf $Path), ($reported -split '\r?\n')[0])
+    } finally {
+        if ($started -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+        $process.Dispose()
+    }
+}
+
+function Install-SetupFiles {
+    param([string]$Stage, [string]$Target, [string[]]$Names)
+    $backup = Join-Path $Stage 'backup'
+    New-Item -ItemType Directory -Path $backup | Out-Null
+    $changed = @()
+    try {
+        foreach ($name in $Names) {
+            $destination = Join-Path $Target $name
+            $existed = Test-Path -LiteralPath $destination
+            if ($existed) { Copy-Item -LiteralPath $destination -Destination (Join-Path $backup $name) }
+            $changed += [pscustomobject]@{ Name = $name; Existed = $existed }
+            Copy-Item -LiteralPath (Join-Path $Stage $name) -Destination $destination -Force
+        }
+    } catch {
+        $originalError = $_
+        foreach ($item in $changed) {
+            $destination = Join-Path $Target $item.Name
+            try {
+                if ($item.Existed) {
+                    Copy-Item -LiteralPath (Join-Path $backup $item.Name) -Destination $destination -Force
+                } elseif (Test-Path -LiteralPath $destination) {
+                    Remove-Item -LiteralPath $destination -Force
+                }
+            } catch { Write-Step '!' "Could not restore $destination. Close the downloader and rerun setup." }
+        }
+        throw $originalError
+    }
+}
+
+# Reuse only the exact published package already installed, with every local file
+# still matching the recorded hash. Executables are run-tested again before commit.
+function Copy-SetupCachedGroup {
+    param([string]$Target, [string]$Stage, [string]$Group, [string]$Key, [string[]]$Files)
+    try {
+        $record = Get-Content -LiteralPath (Join-Path $Target 'installed-helpers.json') -Raw | ConvertFrom-Json
+        $entry = $record.PSObject.Properties[$Group].Value
+        if ($entry.Key -ne $Key) { return $false }
+        foreach ($name in $Files) {
+            $expected = $entry.Hashes.PSObject.Properties[$name].Value
+            if ($expected -notmatch '^[a-fA-F0-9]{64}$' -or (Get-FileHash -LiteralPath (Join-Path $Target $name) -Algorithm SHA256).Hash -ne $expected) { return $false }
+        }
+        foreach ($name in $Files) { Copy-Item -LiteralPath (Join-Path $Target $name) -Destination (Join-Path $Stage $name) -Force }
+        Write-Step 'ok' "$Group is current; reusing verified installed files."
+        return $true
+    } catch { return $false }
+}
+
+function New-SetupHelperRecord {
+    param([string]$Stage, [string]$Key, [string[]]$Files)
+    $hashes = [ordered]@{}
+    foreach ($name in $Files) { $hashes[$name] = (Get-FileHash -LiteralPath (Join-Path $Stage $name) -Algorithm SHA256).Hash }
+    return [pscustomobject]@{ Key = $Key; Hashes = $hashes }
+}
+
+function Get-SetupGalleryRelease {
+    # Digest pinned from the HTTPS-distributed binary, run-tested on Windows.
+    return [pscustomobject]@{
+        Version = '1.32.13'
+        Url = 'https://codeberg.org/mikf/gallery-dl/releases/download/v1.32.13/gallery-dl.exe'
+        Sha256 = 'f9a810132003701af4115a0ee07e84c3f9dd3e59d91bd4a82949f32e6c4318e7'
+    }
+}
+# END GENERATED UPDATE CORE
+
 function Invoke-ReliableDownload {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$Destination,
         [int]$Attempts = 3,
-        [int]$TimeoutSec = 300,
+        [int]$TimeoutSec = 1800,
         [hashtable]$Headers = @{}
     )
-    $previousProgress = $ProgressPreference
-    try {
-        $ProgressPreference = 'SilentlyContinue'
-        for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-            try {
-                Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination -TimeoutSec $TimeoutSec -Headers $Headers
-                if ((Get-Item -LiteralPath $Destination).Length -eq 0) { throw 'The server returned an empty file.' }
-                return $true
-            } catch {
-                if (Test-Path -LiteralPath $Destination) {
-                    Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-                }
-                if ($attempt -eq $Attempts) { throw }
-                Write-Host ('  Download interrupted; retrying ({0}/{1})...' -f $attempt, $Attempts) -ForegroundColor Yellow
-                Start-Sleep -Seconds 2
-            }
-        }
-    } finally {
-        $ProgressPreference = $previousProgress
-    }
-    return $false
+    Get-SetupFile $Url $Destination $Headers -Attempts $Attempts -TimeoutSec $TimeoutSec
+    return $true
 }
 
 function Test-CommandAvailable {
@@ -865,7 +1084,7 @@ function Resolve-LiveDecision {
 }
 
 function Get-DownloaderSettings {
-    $settings = [ordered]@{ OpenFolderAfterDownload = $false }
+    $settings = [ordered]@{ OpenFolderAfterDownload = $false; CheckForUpdates = $true }
     if (Test-Path -LiteralPath $script:SettingsPath -PathType Leaf) {
         try {
             $saved = Get-Content -LiteralPath $script:SettingsPath -Raw | ConvertFrom-Json
@@ -873,6 +1092,8 @@ function Get-DownloaderSettings {
             if ($value -is [bool]) {
                 $settings.OpenFolderAfterDownload = $value
             }
+            $value = Get-PropertyValue -InputObject $saved -Name 'CheckForUpdates'
+            if ($value -is [bool]) { $settings.CheckForUpdates = $value }
         } catch {
             # A missing or corrupt settings file falls back to the defaults above.
         }
@@ -886,7 +1107,13 @@ function Save-DownloaderSettings {
     if (-not (Test-Path -LiteralPath $script:LogsRoot)) {
         [void](New-Item -ItemType Directory -Path $script:LogsRoot -Force)
     }
-    $Settings | ConvertTo-Json | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
+    $temp = $script:SettingsPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        $Settings | ConvertTo-Json | Set-Content -LiteralPath $temp -Encoding UTF8
+        Move-Item -LiteralPath $temp -Destination $script:SettingsPath -Force
+    } finally {
+        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }
+    }
 }
 
 # Decide what to hand explorer.exe after a download. A single file is highlighted with
@@ -1952,38 +2179,12 @@ function Get-InstalledRevision {
 
 # Copy staged app files over the live ones with all-or-nothing rollback: each existing
 # file is backed up first, and if any copy fails every file already swapped is restored
-# before the error is rethrown. Ported from the network installer's Install-SetupFiles.
+# before the error is rethrown. Uses the same worker as the standalone installer.
 function Install-AppFiles {
-    param(
-        [Parameter(Mandatory = $true)][string]$Stage,
+    param([Parameter(Mandatory = $true)][string]$Stage,
         [Parameter(Mandatory = $true)][string]$Target,
-        [Parameter(Mandatory = $true)][string[]]$Names
-    )
-    $backup = Join-Path $Stage 'backup'
-    New-Item -ItemType Directory -Path $backup -Force | Out-Null
-    $changed = @()
-    try {
-        foreach ($name in $Names) {
-            $destination = Join-Path $Target $name
-            $existed = Test-Path -LiteralPath $destination
-            if ($existed) { Copy-Item -LiteralPath $destination -Destination (Join-Path $backup $name) -Force }
-            $changed += [pscustomobject]@{ Name = $name; Existed = $existed }
-            Copy-Item -LiteralPath (Join-Path $Stage $name) -Destination $destination -Force
-        }
-    } catch {
-        $originalError = $_
-        foreach ($item in $changed) {
-            $destination = Join-Path $Target $item.Name
-            try {
-                if ($item.Existed) {
-                    Copy-Item -LiteralPath (Join-Path $backup $item.Name) -Destination $destination -Force
-                } elseif (Test-Path -LiteralPath $destination) {
-                    Remove-Item -LiteralPath $destination -Force
-                }
-            } catch { Write-Host ('  Could not restore {0}. Close the downloader and run the installer.' -f $destination) -ForegroundColor Yellow }
-        }
-        throw $originalError
-    }
+        [Parameter(Mandatory = $true)][string[]]$Names)
+    Install-SetupFiles $Stage $Target $Names
 }
 
 # Pull the newest app source files from the GitHub repo and swap them in place. Only the
@@ -1991,6 +2192,7 @@ function Install-AppFiles {
 # validation failure leaves every file untouched and returns without throwing, so the
 # engine-update steps that follow this call still run.
 function Update-AppFromGitHub {
+    param([string]$Revision)
     Write-Host 'Checking GitHub for a newer app version...' -ForegroundColor DarkGray
 
     # One rate-limited API call to resolve the latest commit; the repo is public so no
@@ -2000,26 +2202,28 @@ function Update-AppFromGitHub {
     $sha = $null
     try {
         $commitApi = 'https://api.github.com/repos/{0}/commits/{1}' -f $script:RepoOwnerName, $script:RepoBranch
-        $sha = (Invoke-RestMethod -Uri $commitApi -Headers $headers -TimeoutSec 30).sha
+        $sha = if ($Revision) { $Revision } else { (Invoke-RestMethod -Uri $commitApi -Headers $headers -TimeoutSec 10).sha }
     } catch {
         Write-Host ('Could not reach GitHub to check for updates: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
-        Write-Host 'Skipping the app update; the engine updates below will still run.' -ForegroundColor DarkGray
-        return
+        Write-Host 'Keeping the current version. You can try again later.' -ForegroundColor DarkGray
+        return $false
     }
     if ([string]$sha -notmatch '^[0-9a-f]{40}$') {
         Write-Host 'GitHub returned an unexpected revision; skipping the app update.' -ForegroundColor Yellow
-        return
+        return $false
     }
 
     $installed = Get-InstalledRevision
     if ($installed -eq $sha) {
         Write-Host ('The app is already up to date (rev {0}).' -f $sha.Substring(0, 7)) -ForegroundColor Green
-        return
+        return $false
     }
 
     Write-Host ('A newer app version is available (rev {0}). Downloading...' -f $sha.Substring(0, 7)) -ForegroundColor Cyan
     $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('seen-app-{0}' -f ([guid]::NewGuid().ToString('N')))
+    $updateLock = $null
     try {
+        $updateLock = [IO.File]::Open((Join-Path $script:Root '.setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
         New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
         # Fetch each app file from raw.githubusercontent pinned to the exact commit. This
@@ -2038,62 +2242,40 @@ function Update-AppFromGitHub {
         [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $stage 'smart-downloader.ps1'), [ref]$tokens, [ref]$parseErrors)
         if ($parseErrors.Count) {
             Write-Host 'The downloaded app failed a syntax check; keeping the current version.' -ForegroundColor Red
-            return
+            return $false
         }
 
-        Install-AppFiles -Stage $stage -Target $script:Root -Names $script:AppFiles
-        Set-Content -LiteralPath (Join-Path $script:Root 'installed-version.txt') -Value $sha -Encoding ASCII
+        Set-Content -LiteralPath (Join-Path $stage 'installed-version.txt') -Value $sha -Encoding ASCII
+        Install-AppFiles -Stage $stage -Target $script:Root -Names ($script:AppFiles + @('installed-version.txt'))
 
-        Write-Host ('App updated to rev {0}. Close and reopen the downloader to run the new version.' -f $sha.Substring(0, 7)) -ForegroundColor Green
+        $script:RestartRequested = $true
+        Write-Host ('App updated to rev {0}. Restarting to load the new version...' -f $sha.Substring(0, 7)) -ForegroundColor Green
+        return $true
     } catch {
         Write-Host ('App update failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
-        Write-Host 'The current app files were left unchanged.' -ForegroundColor DarkGray
+        Write-Host 'Update did not complete. Close other setup windows and try again; downloads and settings are preserved.' -ForegroundColor DarkGray
+        return $false
     } finally {
         if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($updateLock) { $updateLock.Dispose() }
     }
 }
 
 function Update-DownloaderEngine {
+    param([string]$Revision)
     Clear-Terminal
-    Write-Heading -Text 'Update this app + downloader engines'
-
-    # The app updates itself from GitHub first, then the engines update below.
-    Write-Host 'App:' -ForegroundColor Cyan
-    Update-AppFromGitHub
-    Write-Host ''
-
-    # yt-dlp updates itself in place via its own -U command.
-    Write-Host 'yt-dlp:' -ForegroundColor Cyan
-    Write-Host 'Checking for a newer yt-dlp.exe...' -ForegroundColor DarkGray
-    try {
-        & $script:YtDlp @($script:YtDlpBaseArguments) -U 2>&1 | ForEach-Object { Write-Host ([string]$_) }
-        $exitCode = $LASTEXITCODE
-        if ($exitCode -eq 0) {
-            Write-Host 'yt-dlp is up to date (or was updated successfully).' -ForegroundColor Green
-        } else {
-            Write-Host ('The yt-dlp update finished with exit code {0}.' -f $exitCode) -ForegroundColor Yellow
-        }
-    } catch {
-        Write-Host ('Could not update yt-dlp: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    Write-Heading -Text 'Update / repair this app and its helpers'
+    if ($script:DownloadQueue.Count -gt 0) {
+        $answer = (Read-Host 'Updating restarts the app and clears this session queue. Continue? [y/N]').Trim()
+        if ($answer -notin @('y', 'yes')) { return }
     }
-
-    # gallery-dl is updated from the tested, pinned release rather than self-updating.
-    Write-Host ''
-    Write-Host 'gallery-dl:' -ForegroundColor Cyan
-    $release = Get-GalleryDlRelease
-    $installed = Get-GalleryDlVersion
-    if ([string]::IsNullOrWhiteSpace($installed)) {
-        Write-Host 'gallery-dl is not installed.' -ForegroundColor Yellow
-        [void](Install-GalleryDl)
+    if (Invoke-InstallerUpdate -Revision $Revision) {
+        $script:RestartRequested = $true
+        Write-Host 'Update complete. Restarting the downloader...' -ForegroundColor Green
     } else {
-        Write-Host ('Installed: {0} | Tested/pinned: {1}' -f $installed, $release.Version) -ForegroundColor DarkGray
-        if ($installed -eq $release.Version) {
-            Write-Host 'gallery-dl matches the tested release.' -ForegroundColor Green
-        } else {
-            if (Install-GalleryDl) { Write-Host 'gallery-dl updated to the tested release.' -ForegroundColor Green }
-        }
+        Write-Host 'Update did not complete. You can keep using the current app and try again later.' -ForegroundColor Yellow
+        Pause-Terminal
     }
-    Pause-Terminal
 }
 
 function Show-SettingsMenu {
@@ -2106,6 +2288,8 @@ function Show-SettingsMenu {
         Write-Host ('  1. Open the download folder when a download finishes: {0}' -f $state)
         Write-Host ('  2. Manage account profiles (cookie files): {0} configured' -f $profileCount)
         Write-Host ('  3. Review blocked platforms: {0} on hold' -f $heldCount)
+        $updateState = if ($script:Settings.CheckForUpdates) { 'On' } else { 'Off' }
+        Write-Host ('  4. Check for app updates at startup: {0}' -f $updateState)
         Write-Host '  B. Back'
         Write-Host ''
         $choice = (Read-Host 'Choose an option [B]').Trim().ToUpperInvariant()
@@ -2124,9 +2308,13 @@ function Show-SettingsMenu {
             }
             '2' { Show-AccountProfilesMenu }
             '3' { Show-BlockedPlatformsMenu }
+            '4' {
+                $script:Settings.CheckForUpdates = -not $script:Settings.CheckForUpdates
+                try { Save-DownloaderSettings $script:Settings } catch { Write-Host "Could not save settings: $($_.Exception.Message)" -ForegroundColor Yellow; Pause-Terminal }
+            }
             'B' { return }
             default {
-                Write-Host 'Please choose 1-3 or B.' -ForegroundColor Yellow
+                Write-Host 'Please choose 1-4 or B.' -ForegroundColor Yellow
                 Start-Sleep -Seconds 1
             }
         }
@@ -2199,13 +2387,14 @@ function Add-AccountProfileInteractive {
         Pause-Terminal
         return
     }
-    if ($null -eq (New-FilteredCookieFile -SourcePath $path -Platform $platform)) {
+    $validationCookie = New-FilteredCookieFile -SourcePath $path -Platform $platform
+    if ($null -eq $validationCookie) {
         Write-Host ('That file has no {0} cookies, or could not be read/secured. Nothing was saved.' -f (Get-PlatformDisplayName $platform)) -ForegroundColor Red
         Pause-Terminal
         return
     }
     # New-FilteredCookieFile created a temp copy just to validate; sweep it away.
-    Clear-StaleCookieFiles
+    Remove-TemporaryCookieFile $validationCookie
 
     $profiles = @(Read-AccountProfiles)
     $profiles += [pscustomobject]@{ Name = $name; Platform = $platform; CookieFile = $path }
@@ -2268,7 +2457,9 @@ function Show-BlockedPlatformsMenu {
 # when node is usable afterward. Ported from the network installer's Node logic.
 function Install-NodePortable {
     $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('node-{0}' -f ([guid]::NewGuid().ToString('N')))
+    $lock = $null
     try {
+        $lock = [IO.File]::Open((Join-Path $script:Root '.setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
         New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
         Write-Host 'Finding the latest Node.js LTS...' -ForegroundColor DarkGray
@@ -2311,7 +2502,10 @@ function Install-NodePortable {
             Write-Host 'The Node.js archive did not contain node.exe.' -ForegroundColor Red
             return $false
         }
-        Copy-Item -LiteralPath $nodeExe.FullName -Destination (Join-Path $script:Root 'node.exe') -Force
+        Copy-Item -LiteralPath $nodeExe.FullName -Destination (Join-Path $stage 'node.exe')
+        Copy-Item -LiteralPath (Join-Path $nodeExe.DirectoryName 'LICENSE') -Destination (Join-Path $stage 'Node-LICENSE.txt')
+        Test-SetupHelper (Join-Path $stage 'node.exe') '--version'
+        Install-SetupFiles $stage $script:Root @('node.exe', 'Node-LICENSE.txt')
 
         # node.exe now lives beside the script, which is already on this process's PATH
         # (set at startup). Refresh the runtime state so yt-dlp uses it immediately.
@@ -2322,77 +2516,46 @@ function Install-NodePortable {
         return $false
     } finally {
         if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($lock) { $lock.Dispose() }
     }
 }
 
 function Install-NodeRuntime {
-    Write-Host ''
-    Write-Host 'Node.js can be installed automatically (winget, or a portable download if winget is unavailable).' -ForegroundColor Cyan
-    $answer = (Read-Host 'Install Node.js now? [Y]es / [N]o').Trim().ToUpperInvariant()
-    if ($answer -notin @('', 'Y', 'YES')) {
-        return $false
-    }
-
-    # Preferred path: winget installs Node system-wide. If winget is missing or the
-    # install does not yield a working node, fall back to a portable download.
-    if (Test-CommandAvailable -Name 'winget') {
-        Write-Host 'Installing Node.js LTS with winget. You may see a Windows security (UAC) prompt - choose Yes.' -ForegroundColor DarkGray
-        Write-Host ''
-        try {
-            & winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements 2>&1 |
-                ForEach-Object { Write-Host ([string]$_) }
-
-            # winget installs Node to its default location, but the new PATH entry is not
-            # visible to this already-running process. Add the default folder to use it now.
-            $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
-            if ((Test-Path -LiteralPath (Join-Path $nodeDir 'node.exe')) -and (($env:PATH -split ';') -notcontains $nodeDir)) {
-                $env:PATH = $nodeDir + ';' + $env:PATH
-            }
-            if (Test-CommandAvailable -Name 'node') { return $true }
-            Write-Host 'winget did not produce a working Node.js; trying a portable download instead.' -ForegroundColor Yellow
-        } catch {
-            Write-Host ('winget install failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
-            Write-Host 'Trying a portable Node.js download instead...' -ForegroundColor DarkGray
-        }
-    } else {
-        Write-Host 'winget is not available on this PC; downloading a portable Node.js instead.' -ForegroundColor DarkGray
-    }
-
+    Write-Host 'Node.js can be downloaded beside the app. No administrator access is needed.' -ForegroundColor Cyan
+    $answer = (Read-Host 'Download Node.js now? [Y/n]').Trim()
+    if ($answer -notin @('', 'y', 'yes')) { return $false }
     return (Install-NodePortable)
 }
 
 function Install-FfmpegLocal {
-    Write-Host ''
-    Write-Host 'FFmpeg can be downloaded (about 80 MB) straight into this folder - no install needed.' -ForegroundColor Cyan
-    $answer = (Read-Host 'Download FFmpeg now? [Y]es / [N]o').Trim().ToUpperInvariant()
-    if ($answer -notin @('', 'Y', 'YES')) {
-        return $false
-    }
-
-    $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
-    $tempZip = Join-Path ([System.IO.Path]::GetTempPath()) ('ffmpeg-{0}.zip' -f ([guid]::NewGuid().ToString('N')))
-    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ffmpeg-{0}' -f ([guid]::NewGuid().ToString('N')))
-    $succeeded = $false
+    Write-Host 'FFmpeg enables audio conversion and high-quality video. No administrator access is needed.' -ForegroundColor Cyan
+    $answer = (Read-Host 'Download FFmpeg now? [Y/n]').Trim()
+    if ($answer -notin @('', 'y', 'yes')) { return $false }
+    $stage = Join-Path $script:Root ('.setup-' + [guid]::NewGuid().ToString('N'))
+    $lock = $null
     try {
-        Write-Host 'Downloading FFmpeg...' -ForegroundColor DarkGray
-        [void](Invoke-ReliableDownload -Url $url -Destination $tempZip)
-        Write-Host 'Extracting FFmpeg...' -ForegroundColor DarkGray
-        Expand-Archive -LiteralPath $tempZip -DestinationPath $tempDir -Force
-        foreach ($name in @('ffmpeg.exe', 'ffprobe.exe')) {
-            $found = Get-ChildItem -LiteralPath $tempDir -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-            if ($null -ne $found) {
-                Copy-Item -LiteralPath $found.FullName -Destination (Join-Path $script:Root $name) -Force
-            }
+        $lock = [IO.File]::Open((Join-Path $script:Root '.setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+        New-Item -ItemType Directory -Path $stage | Out-Null
+        [void](Get-SetupFfmpeg $stage)
+        Write-Step '*' 'Unpacking FFmpeg...'
+        Expand-Archive -LiteralPath (Join-Path $stage 'ffmpeg.zip') -DestinationPath (Join-Path $stage 'unpacked')
+        foreach ($name in @('ffmpeg.exe', 'ffprobe.exe', 'LICENSE')) {
+            $files = @(Get-ChildItem -LiteralPath (Join-Path $stage 'unpacked') -Recurse -File -Filter $name)
+            if ($files.Count -ne 1) { throw "The archive does not contain exactly one $name." }
+            $destination = if ($name -eq 'LICENSE') { 'FFmpeg-LICENSE.txt' } else { $name }
+            Copy-Item -LiteralPath $files[0].FullName -Destination (Join-Path $stage $destination)
         }
-        $succeeded = Test-Path -LiteralPath (Join-Path $script:Root 'ffmpeg.exe')
+        Test-SetupHelper (Join-Path $stage 'ffmpeg.exe') '-version'
+        Test-SetupHelper (Join-Path $stage 'ffprobe.exe') '-version'
+        Install-SetupFiles $stage $script:Root @('ffmpeg.exe', 'ffprobe.exe', 'FFmpeg-LICENSE.txt')
+        return $true
     } catch {
-        Write-Host ('FFmpeg download failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        Write-Host ('FFmpeg setup failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        return $false
     } finally {
-        if (Test-Path -LiteralPath $tempZip) { Remove-Item -LiteralPath $tempZip -Force -ErrorAction SilentlyContinue }
-        if (Test-Path -LiteralPath $tempDir) { Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($lock) { $lock.Dispose() }
     }
-    return $succeeded
 }
 
 # ===========================================================================
@@ -2500,13 +2663,7 @@ function Get-SocialPostPlatforms {
 # Pinned gallery-dl release. Codeberg publishes no checksum file, so Sha256 is
 # empty by default: Install-GalleryDl then records and fingerprints the binary on
 # first download (trust-on-first-use). Set Sha256 to enforce strict verification.
-function Get-GalleryDlRelease {
-    return [pscustomobject]@{
-        Version = '1.32.13'
-        Url     = 'https://codeberg.org/mikf/gallery-dl/releases/download/v1.32.13/gallery-dl.exe'
-        Sha256  = ''
-    }
-}
+function Get-GalleryDlRelease { return (Get-SetupGalleryRelease) }
 
 function Get-GalleryDlVersion {
     if (-not (Test-Path -LiteralPath $script:GalleryDl -PathType Leaf)) { return $null }
@@ -2540,9 +2697,13 @@ function Install-GalleryDl {
     if ($answer -notin @('', 'Y', 'YES')) { return $false }
 
     $release = Get-GalleryDlRelease
-    $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('gallery-dl-{0}.exe' -f ([guid]::NewGuid().ToString('N')))
+    $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('gallery-dl-' + [guid]::NewGuid().ToString('N'))
+    $temp = Join-Path $stage 'gallery-dl.exe'
+    $lock = $null
     $succeeded = $false
     try {
+        $lock = [IO.File]::Open((Join-Path $script:Root '.setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+        New-Item -ItemType Directory -Path $stage | Out-Null
         Write-Host ('Downloading gallery-dl {0}...' -f $release.Version) -ForegroundColor DarkGray
         [void](Invoke-ReliableDownload -Url $release.Url -Destination $temp)
 
@@ -2558,19 +2719,15 @@ function Install-GalleryDl {
         }
 
         # Smoke-test the fresh binary before it replaces any existing one.
-        $version = $null
-        try { $version = (& $temp --version 2>$null | Select-Object -First 1) } catch { $version = $null }
-        if ([string]::IsNullOrWhiteSpace([string]$version)) {
-            Write-Host 'The downloaded gallery-dl did not run; keeping the previous setup.' -ForegroundColor Red
-            return $false
-        }
-
-        Copy-Item -LiteralPath $temp -Destination $script:GalleryDl -Force
+        Test-SetupHelper $temp '--version'
+        Set-Content (Join-Path $stage 'GalleryDl-LICENSE.txt') 'gallery-dl is GPL v2.0. Source and license: https://codeberg.org/mikf/gallery-dl' -Encoding ASCII
+        Install-SetupFiles $stage $script:Root @('gallery-dl.exe', 'GalleryDl-LICENSE.txt')
         $succeeded = Test-Path -LiteralPath $script:GalleryDl -PathType Leaf
     } catch {
         Write-Host ('gallery-dl download failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
     } finally {
-        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($lock) { $lock.Dispose() }
     }
     return $succeeded
 }
@@ -2921,7 +3078,9 @@ function New-FilteredCookieFile {
     foreach ($line in $lines) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         if ($line.StartsWith('#') -and -not $line.StartsWith('#HttpOnly_')) { continue }
-        $domainField = ($line -split "`t")[0].TrimStart('#').TrimStart('.').ToLowerInvariant()
+        $fields = $line -split "`t"
+        if ($fields.Count -ne 7) { continue }
+        $domainField = ($fields[0] -replace '^#HttpOnly_', '').TrimStart('.').ToLowerInvariant()
         foreach ($d in $domains) {
             if ($domainField -eq $d -or $domainField.EndsWith('.' + $d)) {
                 $kept.Add($line); $matched++; break
@@ -2930,7 +3089,7 @@ function New-FilteredCookieFile {
     }
     if ($matched -eq 0) { return $null }
 
-    $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('{0}{1}.txt' -f (Get-CookieTempPrefix), ([guid]::NewGuid().ToString('N')))
+    $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('{0}{1}-{2}.txt' -f (Get-CookieTempPrefix), $PID, ([guid]::NewGuid().ToString('N')))
     try {
         Set-Content -LiteralPath $temp -Value $kept -Encoding ASCII -ErrorAction Stop
     } catch { return $null }
@@ -2971,7 +3130,8 @@ function Remove-TemporaryCookieFile {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
     $name = Split-Path -Leaf $Path
-    if ($name.StartsWith((Get-CookieTempPrefix)) -and (Test-Path -LiteralPath $Path)) {
+    $parent = [IO.Path]::GetFullPath((Split-Path -Parent $Path)).TrimEnd('\')
+    if ($parent -eq [IO.Path]::GetTempPath().TrimEnd('\') -and $name -match '^seen-dl-cookies-(?:\d+-)?[a-f0-9]{32}\.txt$' -and (Test-Path -LiteralPath $Path)) {
         Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     }
 }
@@ -2980,7 +3140,16 @@ function Remove-TemporaryCookieFile {
 function Clear-StaleCookieFiles {
     $tempRoot = [System.IO.Path]::GetTempPath()
     Get-ChildItem -LiteralPath $tempRoot -Filter ('{0}*' -f (Get-CookieTempPrefix)) -File -ErrorAction SilentlyContinue |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        ForEach-Object {
+            if ($_.Name -match '^seen-dl-cookies-(\d+)-[a-f0-9]{32}\.txt$') {
+                if (-not (Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue)) {
+                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                }
+            } elseif ($_.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddDays(-1)) {
+                # Legacy filenames have no owner PID; allow active old sessions a day.
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
 }
 
 # ===========================================================================
@@ -3120,6 +3289,70 @@ function Get-AppVersion {
     return 'dev build'
 }
 
+function Invoke-InstallerUpdate {
+    param([string]$Revision)
+    $stage = Join-Path ([IO.Path]::GetTempPath()) ('seen-update-' + [guid]::NewGuid().ToString('N'))
+    try {
+        if (-not $Revision) {
+            $headers = @{ 'User-Agent' = 'Seen-Downloader' }
+            if ($env:GITHUB_TOKEN) { $headers.Authorization = 'Bearer ' + $env:GITHUB_TOKEN }
+            $url = 'https://api.github.com/repos/{0}/commits/{1}' -f $script:RepoOwnerName, $script:RepoBranch
+            $Revision = (Invoke-RestMethod -Uri $url -Headers $headers -TimeoutSec 10).sha
+        }
+        if ($Revision -notmatch '^[a-f0-9]{40}$') { throw 'GitHub returned an invalid revision.' }
+        New-Item -ItemType Directory -Path $stage | Out-Null
+        $installerPath = Join-Path $stage 'installer.cmd'
+        $url = 'https://raw.githubusercontent.com/{0}/{1}/Install%20Seen%20Downloader.cmd' -f $script:RepoOwnerName, $Revision
+        [void](Invoke-ReliableDownload $url $installerPath)
+        $parts = [IO.File]::ReadAllText($installerPath) -split '(?m)^# POWERSHELL START\r?$', 2
+        if ($parts.Count -ne 2) { throw 'The downloaded installer is incomplete.' }
+        $tokens = $null; $errors = $null
+        [void][Management.Automation.Language.Parser]::ParseInput($parts[1], [ref]$tokens, [ref]$errors)
+        if ($errors.Count) { throw 'The downloaded installer failed its syntax check.' }
+        $scriptPath = Join-Path $stage 'setup.ps1'
+        [IO.File]::WriteAllText($scriptPath, $parts[1], (New-Object Text.UTF8Encoding($true)))
+        # A fresh process uses the NEW release's helper versions and isolates exit/failure
+        # handling from the running app. The installer owns the shared setup lock.
+        $engine = (Get-Process -Id $PID).Path
+        & $engine -NoLogo -NoProfile -ExecutionPolicy Bypass -File $scriptPath -InstallDir $script:Root -NoLaunch -NoShortcuts -AppRevision $Revision
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        Write-Host ('Could not update: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        return $false
+    } finally {
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-StartupUpdateRevision {
+    param([int]$TimeoutMilliseconds = 3000)
+    Add-Type -AssemblyName System.Net.Http
+    $client = New-Object Net.Http.HttpClient
+    try {
+        $client.Timeout = [TimeSpan]::FromMilliseconds($TimeoutMilliseconds)
+        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', 'Seen-Downloader')
+        if ($env:GITHUB_TOKEN) { [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Authorization', ('Bearer ' + $env:GITHUB_TOKEN)) }
+        $uri = 'https://api.github.com/repos/{0}/commits/{1}' -f $script:RepoOwnerName, $script:RepoBranch
+        $task = $client.GetStringAsync($uri)
+        if (-not $task.Wait($TimeoutMilliseconds)) { return $null }
+        $sha = ($task.GetAwaiter().GetResult() | ConvertFrom-Json).sha
+        if ($sha -match '^[a-f0-9]{40}$') { return [string]$sha }
+    } catch { } finally { $client.Dispose() }
+    return $null
+}
+
+function Invoke-StartupUpdateCheck {
+    if (-not $script:Settings.CheckForUpdates) { return }
+    Write-Host 'Checking for app updates (up to 3 seconds)...' -ForegroundColor DarkGray
+    $revision = Get-StartupUpdateRevision
+    if (-not $revision -or $revision -eq (Get-InstalledRevision)) { return }
+    $choice = Read-MenuChoice -Title 'An app update is available' -Options @(
+        [pscustomobject]@{ Key = 'U'; Label = 'Update now and restart'; Value = 'Update' }
+        [pscustomobject]@{ Key = 'L'; Label = 'Later - continue to the app'; Value = 'Later' }
+    ) -DefaultValue 'Later'
+    if ($choice -eq 'Update') { Update-DownloaderEngine -Revision $revision }
+}
+
 function Show-MainMenu {
     Clear-Terminal
     Write-Host '=============================================' -ForegroundColor Cyan
@@ -3130,7 +3363,7 @@ function Show-MainMenu {
     Write-Host '  2. Download queue'
     Write-Host '  3. View media library sizes'
     Write-Host '  4. View recorded download history'
-    Write-Host '  5. Update this app + downloader engines (from GitHub)'
+    Write-Host '  5. Update / repair app and download helpers'
     Write-Host '  6. Settings'
     Write-Host '  7. Exit'
     Write-Host ''
@@ -3219,7 +3452,12 @@ $script:Settings = Get-DownloaderSettings
 # Remove any application-owned temporary cookie copies left by a prior crash.
 Clear-StaleCookieFiles
 
-while ($true) {
+# Never make tests, piped commands, or a developer checkout depend on the network.
+if (-not $NoUpdateCheck -and $MyInvocation.InvocationName -ne '.' -and -not [Console]::IsInputRedirected -and -not (Test-Path -LiteralPath (Join-Path $script:Root '.git'))) {
+    Invoke-StartupUpdateCheck
+}
+
+while (-not $script:RestartRequested) {
     Show-MainMenu
     $menuChoice = (Read-Host 'Choose an option [1]').Trim().ToUpperInvariant()
     if ([string]::IsNullOrWhiteSpace($menuChoice)) { $menuChoice = '1' }
@@ -3240,4 +3478,7 @@ while ($true) {
     if ($menuChoice -in @('7', 'Q')) { break }
 }
 
-Write-Host 'Goodbye.' -ForegroundColor Cyan
+if ($script:RestartRequested) {
+    if ($env:SEEN_LAUNCHER -eq '1') { exit 42 }
+    Write-Host 'Update complete. Reopen the downloader to use the new version.' -ForegroundColor Green
+} else { Write-Host 'Goodbye.' -ForegroundColor Cyan }

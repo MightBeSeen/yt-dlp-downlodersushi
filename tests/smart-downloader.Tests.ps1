@@ -34,6 +34,10 @@ function Read-Host {
 }
 . $downloaderPath *> $null
 $script:loadingDownloader = $false
+# The fake downloader never invokes FFmpeg. Keep this offline suite independent
+# of a developer's globally installed multimedia tools.
+$script:FfmpegAvailable = $true
+function Test-FfmpegReady { $script:FfmpegAvailable = $true; return $true }
 
 $testRoot = Join-Path $projectRoot '.test-temp\regression'
 if (Test-Path -LiteralPath $testRoot) {

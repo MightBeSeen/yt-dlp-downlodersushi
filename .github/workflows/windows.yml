@@ -1,0 +1,53 @@
+name: Windows tests and update channel
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+      - name: Run offline regression suites
+        shell: pwsh
+        run: ./scripts/Test-Project.ps1 -Engine '${{ matrix.engine }}'
+
+  publish:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Publish tested commit to the stable update channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          newest="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$newest" != "$GITHUB_SHA" ]; then
+            echo "A newer push exists; it will publish after its tests pass."
+            exit 0
+          fi
+          git push origin "$GITHUB_SHA:refs/heads/stable"

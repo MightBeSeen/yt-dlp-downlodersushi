@@ -63,29 +63,81 @@ try {
 
     # Exercise retry behavior without network access or delays.
     $script:attempts = 0
-    function Invoke-WebRequest {
-        param([switch]$UseBasicParsing, $Uri, $OutFile, $Headers, $TimeoutSec)
+    function Invoke-SetupTransfer {
+        param($Url, $Destination, $Headers, $IdleTimeoutSec, $TimeoutSec)
         $script:attempts++
         if ($script:attempts -lt 3) { throw 'network disconnected' }
-        Set-Content -LiteralPath $OutFile 'downloaded'
+        Set-Content -LiteralPath $Destination 'downloaded'
     }
     function Start-Sleep { param($Seconds) }
     Get-SetupFile 'https://example.invalid/file' (Join-Path $tempRoot 'retry.txt')
     Assert ($script:attempts -eq 3) 'transient download failures retry successfully'
     $script:attempts = 0
-    function Invoke-WebRequest {
-        param([switch]$UseBasicParsing, $Uri, $OutFile, $Headers, $TimeoutSec)
+    function Invoke-SetupTransfer {
+        param($Url, $Destination, $Headers, $IdleTimeoutSec, $TimeoutSec)
         $script:attempts++
+        Set-Content -LiteralPath $Destination 'partial data'
         throw 'offline'
     }
     $failed = $false
     try { Get-SetupFile 'https://example.invalid/file' (Join-Path $tempRoot 'offline.txt') } catch { $failed = $true }
     Assert ($failed -and $script:attempts -eq 3) 'permanent download failure stops after three attempts'
+    Assert (-not (Test-Path (Join-Path $tempRoot 'offline.txt.part'))) 'failed transfer removes partial file'
+    Assert (-not (Test-Path (Join-Path $tempRoot 'offline.txt'))) 'failed transfer never publishes a completed file'
+
+    # Exercise real FFmpeg source selection and hash validation with fake transports.
+    $script:urls = @()
+    $script:fixtureHash = $hash
+    $script:badGithubHash = $false
+    function Invoke-SetupTransfer {
+        param($Url, $Destination, $Headers, $IdleTimeoutSec, $TimeoutSec)
+        $script:urls += $Url
+        if ($Url -match '/releases/latest$') {
+            if (-not $script:badGithubHash) { throw 'HTTP 503' }
+            Set-Content -LiteralPath $Destination ('{"assets":[{"name":"ffmpeg-9.0-essentials_build.zip","digest":"sha256:' + ('0' * 64) + '","browser_download_url":"https://github.com/GyanD/codexffmpeg/releases/download/9.0/ffmpeg-9.0-essentials_build.zip"}]}')
+        } elseif ($Url -like '*.sha256') {
+            Set-Content -LiteralPath $Destination $script:fixtureHash
+        } else {
+            Copy-Item -LiteralPath $file -Destination $Destination
+        }
+    }
+    [void](Get-SetupFfmpeg $tempRoot)
+    Assert ($script:urls[-1] -like 'https://www.gyan.dev/*zip') 'FFmpeg switches publisher hosts when GitHub is unavailable'
+    Assert ((Get-FileHash (Join-Path $tempRoot 'ffmpeg.zip')).Hash -eq $hash) 'fallback FFmpeg ZIP is hash verified'
+    $script:badGithubHash = $true
+    $script:urls = @()
+    [void](Get-SetupFfmpeg $tempRoot)
+    Assert ($script:urls.Count -eq 4 -and $script:urls[-1] -like 'https://www.gyan.dev/*zip') 'corrupt GitHub ZIP triggers independently verified fallback'
+
+    $helper = (Get-Command powershell.exe).Source
+    Test-SetupHelper $helper '-NoProfile -Command "Write-Output fixture-version"'
+    $failed = $false
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try { Test-SetupHelper $helper '-NoProfile -Command "Start-Sleep -Seconds 30"' -TimeoutSec 1 } catch { $failed = $_.Exception.Message -match 'did not respond' }
+    Assert ($failed -and $clock.Elapsed.TotalSeconds -lt 5) 'unresponsive helper is terminated promptly'
+    $failed = $false
+    try { Test-SetupHelper $helper '-NoProfile -Command "exit 2"' } catch { $failed = $_.Exception.Message -match 'could not run' }
+    Assert $failed 'helper exit failure rejects installation'
+    $failed = $false
+    try { Test-SetupHelper (Join-Path $tempRoot 'missing-helper.exe') } catch { $failed = $_.Exception.Message -notmatch 'Id|HasExited' }
+    Assert $failed 'helper startup failure preserves original error'
     # gallery-dl is staged as a first-class helper: downloaded, run-tested, and
     # included in the atomic install set (it has no checksum to verify).
-    Assert ($source -match 'releases/download/\$gdlVersion/gallery-dl\.exe') 'installer downloads the pinned gallery-dl.exe'
+    $gallery = Get-SetupGalleryRelease
+    Assert ($gallery.Url -match '/v1\.32\.13/gallery-dl\.exe$' -and $gallery.Sha256 -match '^[a-f0-9]{64}$') 'installer pins gallery-dl version and SHA256'
     Assert ($source -match "foreach \(\`$name in @\('yt-dlp\.exe'[^\)]*'gallery-dl\.exe'\)") 'installer run-tests gallery-dl.exe with the other helpers'
     Assert ($source -match "\`$names = \`$appFiles \+ @\([^\)]*'gallery-dl\.exe'[^\)]*'GalleryDl-LICENSE\.txt'") 'installer installs gallery-dl.exe and its license notice'
+
+    $cacheTarget = Join-Path $tempRoot 'cache-target'
+    $cacheStage = Join-Path $tempRoot 'cache-stage'
+    New-Item -ItemType Directory -Path $cacheTarget,$cacheStage | Out-Null
+    Set-Content (Join-Path $cacheTarget 'node.exe') 'working binary'
+    $records = @{ node = (New-SetupHelperRecord $cacheTarget 'v1' @('node.exe')) }
+    $records | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $cacheTarget 'installed-helpers.json')
+    Assert (Copy-SetupCachedGroup $cacheTarget $cacheStage 'node' 'v1' @('node.exe')) 'same verified helper package is reused'
+    Assert (-not (Copy-SetupCachedGroup $cacheTarget $cacheStage 'node' 'v2' @('node.exe'))) 'new helper version forces a download'
+    Set-Content (Join-Path $cacheTarget 'node.exe') 'damaged binary'
+    Assert (-not (Copy-SetupCachedGroup $cacheTarget $cacheStage 'node' 'v1' @('node.exe'))) 'changed or corrupt helper is not reused'
     Write-Host 'Installer tests passed.' -ForegroundColor Green
 } finally {
     $expectedParent = [IO.Path]::GetFullPath((Join-Path $root '.test-temp'))

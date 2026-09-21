@@ -108,12 +108,16 @@ $srcCookie = Join-Path $sandbox 'cookies.txt'
     '# Netscape HTTP Cookie File',
     "x.com`tTRUE`t/`tTRUE`t9999999999`tauth_token`tSECRETX",
     ".x.com`tTRUE`t/`tTRUE`t9999999999`tct0`tSECRETCT0",
+    "#HttpOnly_x.com`tFALSE`t/`tTRUE`t9999999999`tauth_token`tHTTPONLYSECRET",
     "instagram.com`tTRUE`t/`tTRUE`t9999999999`tsessionid`tSECRETIG"
 ) | Set-Content -LiteralPath $srcCookie -Encoding ASCII
 $filtered = New-FilteredCookieFile -SourcePath $srcCookie -Platform 'x'
 Assert ($null -ne $filtered -and (Test-Path -LiteralPath $filtered)) 'filtered cookie file created'
 $filteredContent = Get-Content -Raw -LiteralPath $filtered
+Clear-StaleCookieFiles
+Assert (Test-Path -LiteralPath $filtered) 'startup cleanup preserves cookies belonging to a live session'
 Assert (($filteredContent -match 'SECRETX') -and ($filteredContent -match 'SECRETCT0')) 'keeps x.com cookies'
+Assert ($filteredContent -match '#HttpOnly_.*HTTPONLYSECRET') 'preserves HttpOnly login cookies and their Netscape prefix'
 Assert (-not ($filteredContent -match 'SECRETIG')) 'drops other-platform cookies'
 Assert ((Get-Content -Raw -LiteralPath $srcCookie) -match 'SECRETIG') 'original cookie file is untouched'
 Remove-TemporaryCookieFile -Path $filtered
@@ -137,6 +141,7 @@ Remove-TemporaryCookieFile -Path $resolved
 # Clear-StaleCookieFiles removes leftover app-owned temp cookies.
 $stale = Join-Path ([System.IO.Path]::GetTempPath()) ('{0}stale.txt' -f (Get-CookieTempPrefix))
 Set-Content -LiteralPath $stale -Value 'x' -Encoding ASCII
+(Get-Item -LiteralPath $stale).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-2)
 Clear-StaleCookieFiles
 Assert (-not (Test-Path -LiteralPath $stale)) 'startup sweep removes stale temp cookies'
 
