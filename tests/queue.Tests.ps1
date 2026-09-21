@@ -12,6 +12,7 @@ function Assert($Condition,$Message) {
 function Clear-Terminal {}
 function Show-DownloadHeader {}
 function Initialize-DownloadDependencies { $true }
+function Get-QueueItemDelaySeconds { 0 }   # keep queue tests fast; pacing tested separately
 function Read-Host {
     param($Prompt)
     if($script:answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }

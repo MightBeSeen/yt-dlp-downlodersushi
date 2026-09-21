@@ -81,6 +81,11 @@ try {
     $failed = $false
     try { Get-SetupFile 'https://example.invalid/file' (Join-Path $tempRoot 'offline.txt') } catch { $failed = $true }
     Assert ($failed -and $script:attempts -eq 3) 'permanent download failure stops after three attempts'
+    # gallery-dl is staged as a first-class helper: downloaded, run-tested, and
+    # included in the atomic install set (it has no checksum to verify).
+    Assert ($source -match 'releases/download/\$gdlVersion/gallery-dl\.exe') 'installer downloads the pinned gallery-dl.exe'
+    Assert ($source -match "foreach \(\`$name in @\('yt-dlp\.exe'[^\)]*'gallery-dl\.exe'\)") 'installer run-tests gallery-dl.exe with the other helpers'
+    Assert ($source -match "\`$names = \`$appFiles \+ @\([^\)]*'gallery-dl\.exe'[^\)]*'GalleryDl-LICENSE\.txt'") 'installer installs gallery-dl.exe and its license notice'
     Write-Host 'Installer tests passed.' -ForegroundColor Green
 } finally {
     $expectedParent = [IO.Path]::GetFullPath((Join-Path $root '.test-temp'))

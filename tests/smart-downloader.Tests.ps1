@@ -63,8 +63,10 @@ $script:DownloadsRoot = Join-Path $testRoot 'Downloads'
 $script:LogsRoot = Join-Path $testRoot 'logs'
 $script:HistoryPath = Join-Path $script:LogsRoot 'download-history.csv'
 $script:promptAnswers = New-Object System.Collections.Generic.Queue[string]
-# Prompt order: URL, format ('' -> mp4), video quality ('' -> best), live mode (N -> normal).
+# Prompt order: URL, mode ('' -> Video/audio), format ('' -> mp4), video quality
+# ('' -> best), live mode (N -> normal), review ('' -> Start).
 $script:promptAnswers.Enqueue('https://www.youtube.com/watch?v=yxf9w1gJea4')
+$script:promptAnswers.Enqueue('')
 $script:promptAnswers.Enqueue('')
 $script:promptAnswers.Enqueue('')
 $script:promptAnswers.Enqueue('N')

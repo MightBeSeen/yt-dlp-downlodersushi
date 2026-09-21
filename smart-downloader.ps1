@@ -9,6 +9,7 @@ if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
 
 $script:Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:YtDlp = Join-Path $script:Root 'yt-dlp.exe'
+$script:GalleryDl = Join-Path $script:Root 'gallery-dl.exe'
 
 # Make helpers that live beside the script (e.g. a downloaded ffmpeg.exe) discoverable to
 # both this process and the yt-dlp child process, without touching the system PATH.
@@ -49,10 +50,17 @@ $script:HistoryPath = Join-Path $script:LogsRoot 'download-history.csv'
 $script:SettingsPath = Join-Path $script:LogsRoot 'settings.json'
 $script:OutputMarker = '__SMART_DOWNLOADER_FILE__:'
 $script:DownloadQueue = New-Object System.Collections.Generic.List[object]
+$script:ExplorerFocusTypeReady = $false
+# Image formats produced by gallery-dl social-post downloads. Kept separate so the
+# social engine can target video+image explicitly, and folded into the media set
+# below so the library report and completed-file detection see downloaded images.
+$script:ImageExtensions = @(
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.heic', '.heif'
+)
 $script:MediaExtensions = @(
     '.mp4', '.mkv', '.webm', '.mov', '.avi', '.flv',
     '.mp3', '.m4a', '.aac', '.wav', '.opus', '.ogg', '.flac'
-)
+) + $script:ImageExtensions
 
 try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -1079,6 +1087,16 @@ function Show-DownloadReview {
     param([Parameter(Mandatory = $true)][object]$Request)
     Clear-Terminal
     Write-Heading -Text 'Review download'
+    if ((Get-PropertyValue -InputObject $Request -Name 'Mode') -eq 'SocialPost') {
+        Write-Host ('Platform: {0}' -f (Get-PlatformDisplayName -Platform $Request.Platform))
+        Write-Host ('URL: {0}' -f $Request.Url)
+        $scopeLabel = if (Get-PropertyValue -InputObject $Request -Name 'IncludeManifest') { 'Entire social post (include manifest)' } else { 'Media only (photos and videos)' }
+        Write-Host ('Mode: {0}, source quality' -f $scopeLabel)
+        $accountName = if ($null -ne $Request.Account) { $Request.Account.Name } else { 'Anonymous' }
+        Write-Host ('Account: {0}' -f $accountName)
+        Write-Host ('Destination: {0}' -f (Get-RelativeDisplayPath -Path $Request.TargetFolder))
+        return
+    }
     if ($Request.Title) { Write-Host $Request.Title }
     Write-Host ('URL: {0}' -f $Request.Url)
     Write-Host ('Format: {0}' -f $Request.Preset.ToUpperInvariant())
@@ -1087,6 +1105,60 @@ function Show-DownloadReview {
     Write-Host ('Live: {0}' -f $Request.LiveDecision.Description)
     Write-Host ('Scope: {0}' -f $(if ($Request.PlaylistMode -eq 'Playlist') { 'Full playlist' } else { 'Single video' }))
     Write-Host ('Destination: {0}' -f $Request.TargetFolder)
+}
+
+# The set of functional download modes. Phase 2 appends 'SocialPost' once the
+# gallery-dl engine exists; until then only video/audio is offered.
+function Get-AvailableDownloadModes {
+    return @('VideoAudio', 'SocialPost')
+}
+
+# Last mode chosen this session, defaulting to video/audio. Read defensively so a
+# fresh process (or a function-only test harness) never trips StrictMode.
+function Get-LastDownloadMode {
+    if (Test-Path variable:script:LastMode) { return $script:LastMode }
+    return 'VideoAudio'
+}
+
+# Ask for the download mode. With a single available mode this returns it without
+# prompting, so the existing flow is unchanged until more modes are registered.
+# Returns $null when the user backs out.
+function Read-DownloadMode {
+    param([string]$DefaultValue = 'VideoAudio', [string]$Url)
+    if (-not [string]::IsNullOrWhiteSpace($Url)) {
+        if ((Get-UrlPlatform -Url $Url) -in (Get-SocialPostPlatforms)) { return 'SocialPost' }
+        return 'VideoAudio'
+    }
+    $modes = @(Get-AvailableDownloadModes)
+    if ($modes.Count -le 1) { return $modes[0] }
+    $labels = @{ VideoAudio = 'Video / audio'; SocialPost = 'Entire social post' }
+    $default = if ($modes -contains $DefaultValue) { $DefaultValue } else { $modes[0] }
+    $options = foreach ($m in $modes) {
+        [pscustomobject]@{ Key = [string]([array]::IndexOf($modes, $m) + 1); Label = $labels[$m]; Value = $m }
+    }
+    return Read-MenuChoice -Title 'What do you want to download?' -Options $options -DefaultValue $default
+}
+
+# Account profiles matching a URL's platform. Anonymous is offered whenever the
+# URL's platform has no configured profile.
+function Get-AccountProfilesForUrl {
+    param([string]$Url)
+    $platform = Get-UrlPlatform -Url $Url
+    if ([string]::IsNullOrEmpty($platform)) { return @() }
+    return @(Read-AccountProfiles | Where-Object { $_.Platform -eq $platform })
+}
+
+# Choose an account profile for the request. Returns $null for Anonymous, which is
+# the only option until profiles exist. Anonymous is always the default.
+function Read-AccountProfile {
+    param([string]$Url)
+    $profiles = @(Get-AccountProfilesForUrl -Url $Url)
+    if ($profiles.Count -eq 0) { return $null }
+    $options = @([pscustomobject]@{ Key = '1'; Label = 'Anonymous'; Value = $null })
+    for ($i = 0; $i -lt $profiles.Count; $i++) {
+        $options += [pscustomobject]@{ Key = [string]($i + 2); Label = $profiles[$i].Name; Value = $profiles[$i] }
+    }
+    return Read-MenuChoice -Title 'Account' -Options $options -DefaultValue $null
 }
 
 function New-DownloadRequest {
@@ -1106,11 +1178,54 @@ function New-DownloadRequest {
         return
     }
 
-    if (-not (Initialize-DownloadDependencies)) { return }
+    # Decide mode and authentication before any dependency check or probe, so the
+    # right dependencies are validated and no speculative request is issued for
+    # social/authenticated downloads.
+    $mode = Read-DownloadMode -DefaultValue (Get-LastDownloadMode) -Url $url
+    if ($null -eq $mode) { return }
+    $script:LastMode = $mode
 
-    # Optional metadata must never hold up the questions or confirmation.
+    $account = Read-AccountProfile -Url $url  # $null = Anonymous
+
+    if (-not (Resolve-RequestDependencies -Mode $mode)) { return }
+
+    # A platform hold blocks work across both engines and every account.
+    $urlPlatform = Get-UrlPlatform -Url $url
+    if (-not [string]::IsNullOrEmpty($urlPlatform) -and (Test-PlatformHeld -Platform $urlPlatform)) {
+        $hold = Get-PlatformHold -Platform $urlPlatform
+        Write-Host ('{0} is on hold: {1}' -f (Get-PlatformDisplayName $urlPlatform), (Get-PropertyValue -InputObject $hold -Name 'reason')) -ForegroundColor Red
+        Write-Host 'Release it from Settings > Review blocked platforms before downloading.' -ForegroundColor Yellow
+        Pause-Terminal
+        return
+    }
+
+    # Entire-post mode skips the yt-dlp question flow entirely: it offers no
+    # resolution/audio/playlist choices, so it goes straight to review.
+    if ($mode -eq 'SocialPost') {
+        $request = New-SocialPostRequest -Url $url -Account $account
+        if ($null -eq $request) { return }
+        $scope = Read-MenuChoice -Title 'What should be saved?' -Options @(
+            [pscustomobject]@{ Key = '1'; Label = 'Media only (photos and videos)'; Value = 'Media' }
+            [pscustomobject]@{ Key = '2'; Label = 'Entire social post (include manifest)'; Value = 'Manifest' }
+        ) -DefaultValue 'Media'
+        if ($null -eq $scope) { return }
+        $request.IncludeManifest = ($scope -eq 'Manifest')
+        Show-DownloadReview -Request $request
+        $review = Read-MenuChoice -Title 'Ready?' -RedrawHeader { Show-DownloadReview -Request $request } -Options @(
+            [pscustomobject]@{ Key = '1'; Label = $(if ($ForQueue) { 'Add to queue' } else { 'Start download' }); Value = 'Start' }
+            [pscustomobject]@{ Key = '2'; Label = 'Cancel'; Value = 'Cancel' }
+        )
+        if ($review -ne 'Start') { return }
+        return $request
+    }
+
+    # Optional metadata must never hold up the questions or confirmation, and is only
+    # gathered for anonymous video/audio requests: social/entire-post extraction and
+    # any authenticated request must not fire a pre-confirmation probe.
     $probeJob = $null
-    try { $probeJob = Start-MetadataProbe -Url $url } catch {}
+    if ($mode -eq 'VideoAudio' -and $null -eq $account) {
+        try { $probeJob = Start-MetadataProbe -Url $url } catch {}
+    }
     $probe = $null
     $metadataFrozen = $false
     $clipTitle = ''
@@ -1208,6 +1323,7 @@ function New-DownloadRequest {
                     Url = $url; Title = $clipTitle; Preset = $preset; Quality = $quality
                     LiveDecision = $liveDecision; PlaylistMode = $playlistMode
                     TargetFolder = $targetFolder; Status = 'Pending'
+                    Mode = $mode; Account = $account
                 }
                 Show-DownloadReview -Request $request
                 $review = Read-MenuChoice -Title 'Ready?' -RedrawHeader { Show-DownloadReview -Request $request } -Options @(
@@ -1236,13 +1352,23 @@ function Start-SmartDownload {
 }
 
 function Invoke-MediaProcess {
-    param([string[]]$Arguments, [scriptblock]$OnOutput)
+    param(
+        [string[]]$Arguments,
+        [scriptblock]$OnOutput,
+        # Defaults to yt-dlp so existing callers are unchanged; other engines
+        # (gallery-dl) pass their own executable path. Evaluated at call time.
+        [string]$ExecutablePath = $script:YtDlp,
+        [string]$WorkingDirectory
+    )
     $info = New-Object System.Diagnostics.ProcessStartInfo
-    $info.FileName = $script:YtDlp
+    $info.FileName = $ExecutablePath
     $info.Arguments = ($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
-    if ([IO.Path]::GetExtension($script:YtDlp) -eq '.cmd') {
+    if ([IO.Path]::GetExtension($ExecutablePath) -eq '.cmd') {
         $info.FileName = $env:ComSpec
-        $info.Arguments = '/d /s /c ""' + $script:YtDlp + '" ' + $info.Arguments + '"'
+        $info.Arguments = '/d /s /c ""' + $ExecutablePath + '" ' + $info.Arguments + '"'
+    }
+    if (-not [string]::IsNullOrEmpty($WorkingDirectory)) {
+        $info.WorkingDirectory = $WorkingDirectory
     }
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
@@ -1305,7 +1431,18 @@ function Invoke-MediaProcess {
     }
 }
 
+# Dispatch a request to the engine for its mode. Requests without a Mode (legacy
+# queue items, older tests) are treated as video/audio.
 function Invoke-DownloadRequest {
+    param([Parameter(Mandatory = $true)][object]$Request, [switch]$Queued, [string]$QueueLabel = '')
+    $mode = Get-PropertyValue -InputObject $Request -Name 'Mode'
+    if ($mode -eq 'SocialPost') {
+        return (Invoke-SocialPostRequest -Request $Request -Queued:$Queued -QueueLabel $QueueLabel)
+    }
+    return (Invoke-YtDlpRequest -Request $Request -Queued:$Queued -QueueLabel $QueueLabel)
+}
+
+function Invoke-YtDlpRequest {
     param([Parameter(Mandatory = $true)][object]$Request, [switch]$Queued, [string]$QueueLabel = '')
     $url = $Request.Url
     $preset = $Request.Preset
@@ -1496,19 +1633,59 @@ function Invoke-DownloadRequest {
     }
 }
 
+# The full queue outcome model. yt-dlp only produces the original subset today;
+# Partial and Blocked are reserved for the gallery-dl engine and platform holds.
+# Exposed as functions (not script bootstrap vars) so every function-loaded test
+# harness sees them without replicating startup state.
+function Get-QueueStates {
+    return @('Pending', 'Downloading', 'Completed', 'Partial', 'Failed', 'Interrupted', 'Blocked')
+}
+
+# "Retry failed / interrupted" reruns these; Blocked is never cleared by a retry.
+function Get-QueueRetryStates {
+    return @('Partial', 'Failed', 'Interrupted')
+}
+
+# Delay (seconds) inserted between consecutive queued source-URL downloads. A
+# product default, not a safety threshold; overridable in tests.
+function Get-QueueItemDelaySeconds {
+    return (Get-Random -Minimum 5 -Maximum 11)
+}
+
 function Start-DownloadQueue {
     param([switch]$RetryFailed)
     if ($RetryFailed) {
+        $retryStates = Get-QueueRetryStates
         foreach ($item in $script:DownloadQueue) {
-            if ($item.Status -in @('Failed', 'Interrupted')) { $item.Status = 'Pending' }
+            # Blocked items are held deliberately and must never be reset by a retry.
+            if ($item.Status -in $retryStates) { $item.Status = 'Pending' }
         }
     }
     $pending = @($script:DownloadQueue.ToArray() | Where-Object { $_.Status -eq 'Pending' })
     if ($pending.Count -eq 0) { return }
-    if (-not (Initialize-DownloadDependencies)) { return }
+
+    # Validate each mode present once, up front. Video/audio uses the original
+    # combined check; entire-post additionally needs gallery-dl.
+    $modes = @($pending | ForEach-Object { $m = Get-PropertyValue -InputObject $_ -Name 'Mode'; if ([string]::IsNullOrEmpty($m)) { 'VideoAudio' } else { $m } } | Sort-Object -Unique)
+    if ($modes -contains 'VideoAudio' -and -not (Initialize-DownloadDependencies)) { return }
+    if ($modes -contains 'SocialPost' -and -not (Resolve-RequestDependencies -Mode 'SocialPost')) { return }
+
     $position = 0
+    $ranAny = $false
     foreach ($item in $pending) {
         $position++
+
+        # Re-check the platform hold immediately before execution.
+        $platform = Get-PropertyValue -InputObject $item -Name 'Platform'
+        if ([string]::IsNullOrEmpty($platform)) { $platform = Get-UrlPlatform -Url $item.Url }
+        if (-not [string]::IsNullOrEmpty($platform) -and (Test-PlatformHeld -Platform $platform)) {
+            $item.Status = 'Blocked'
+            continue
+        }
+
+        # Pace between actual source-URL downloads, never before the first one.
+        if ($ranAny) { Start-Sleep -Seconds (Get-QueueItemDelaySeconds) }
+
         $item.Status = 'Downloading'
         try {
             $result = Invoke-DownloadRequest -Request $item -Queued -QueueLabel "$position/$($pending.Count)"
@@ -1521,6 +1698,7 @@ function Start-DownloadQueue {
         } finally {
             if ($item.Status -eq 'Downloading') { $item.Status = 'Interrupted' }
         }
+        $ranAny = $true
         if ($item.Status -eq 'Interrupted') { break }
     }
     Clear-Terminal
@@ -1567,7 +1745,8 @@ function Show-DownloadQueue {
         Clear-Terminal
         Write-Heading -Text 'Download queue'
         $pendingCount = @($script:DownloadQueue.ToArray() | Where-Object { $_.Status -eq 'Pending' }).Count
-        $retryCount = @($script:DownloadQueue.ToArray() | Where-Object { $_.Status -in @('Failed', 'Interrupted') }).Count
+        $retryStates = Get-QueueRetryStates
+        $retryCount = @($script:DownloadQueue.ToArray() | Where-Object { $_.Status -in $retryStates }).Count
         $choice = Read-MenuChoice -Title ('{0} items | {1} pending' -f $script:DownloadQueue.Count, $pendingCount) -Notes @('Cleared when you close the app.') -AllowBack -Options @(
             [pscustomobject]@{ Key = '1'; Label = 'Add link'; Value = 'Add' }
             [pscustomobject]@{ Key = '2'; Label = 'View / remove'; Value = 'View'; Disabled = ($script:DownloadQueue.Count -eq 0) }
@@ -1708,20 +1887,39 @@ function Show-DownloadHistory {
 }
 
 function Update-DownloaderEngine {
-    Write-Heading -Text 'Update downloader engine'
+    Clear-Terminal
+    Write-Heading -Text 'Update downloader engines'
+
+    # yt-dlp updates itself in place via its own -U command.
+    Write-Host 'yt-dlp:' -ForegroundColor Cyan
     Write-Host 'Checking for a newer yt-dlp.exe...' -ForegroundColor DarkGray
-    Write-Host ''
     try {
         & $script:YtDlp @($script:YtDlpBaseArguments) -U 2>&1 | ForEach-Object { Write-Host ([string]$_) }
         $exitCode = $LASTEXITCODE
-        Write-Host ''
         if ($exitCode -eq 0) {
             Write-Host 'yt-dlp is up to date (or was updated successfully).' -ForegroundColor Green
         } else {
-            Write-Host ('The update command finished with exit code {0}.' -f $exitCode) -ForegroundColor Yellow
+            Write-Host ('The yt-dlp update finished with exit code {0}.' -f $exitCode) -ForegroundColor Yellow
         }
     } catch {
         Write-Host ('Could not update yt-dlp: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    }
+
+    # gallery-dl is updated from the tested, pinned release rather than self-updating.
+    Write-Host ''
+    Write-Host 'gallery-dl:' -ForegroundColor Cyan
+    $release = Get-GalleryDlRelease
+    $installed = Get-GalleryDlVersion
+    if ([string]::IsNullOrWhiteSpace($installed)) {
+        Write-Host 'gallery-dl is not installed.' -ForegroundColor Yellow
+        [void](Install-GalleryDl)
+    } else {
+        Write-Host ('Installed: {0} | Tested/pinned: {1}' -f $installed, $release.Version) -ForegroundColor DarkGray
+        if ($installed -eq $release.Version) {
+            Write-Host 'gallery-dl matches the tested release.' -ForegroundColor Green
+        } else {
+            if (Install-GalleryDl) { Write-Host 'gallery-dl updated to the tested release.' -ForegroundColor Green }
+        }
     }
     Pause-Terminal
 }
@@ -1731,10 +1929,14 @@ function Show-SettingsMenu {
         Clear-Terminal
         Write-Heading -Text 'Settings'
         $state = if ($script:Settings.OpenFolderAfterDownload) { 'On' } else { 'Off' }
+        $profileCount = @(Read-AccountProfiles).Count
+        $heldCount = @((Read-PlatformHolds).Keys).Count
         Write-Host ('  1. Open the download folder when a download finishes: {0}' -f $state)
+        Write-Host ('  2. Manage account profiles (cookie files): {0} configured' -f $profileCount)
+        Write-Host ('  3. Review blocked platforms: {0} on hold' -f $heldCount)
         Write-Host '  B. Back'
         Write-Host ''
-        $choice = (Read-Host 'Choose an option to toggle [B]').Trim().ToUpperInvariant()
+        $choice = (Read-Host 'Choose an option [B]').Trim().ToUpperInvariant()
         if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'B' }
         switch ($choice) {
             '1' {
@@ -1748,9 +1950,140 @@ function Show-SettingsMenu {
                 }
                 Start-Sleep -Seconds 1
             }
+            '2' { Show-AccountProfilesMenu }
+            '3' { Show-BlockedPlatformsMenu }
             'B' { return }
             default {
-                Write-Host 'Please choose 1 or B.' -ForegroundColor Yellow
+                Write-Host 'Please choose 1-3 or B.' -ForegroundColor Yellow
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+}
+
+# Manage cookie-file account profiles. Profiles store only a name, platform, and
+# path - never cookie values.
+function Show-AccountProfilesMenu {
+    while ($true) {
+        Clear-Terminal
+        Write-Heading -Text 'Account profiles'
+        Write-Host 'Profiles let entire-post mode use a signed-in session for gated posts.' -ForegroundColor DarkGray
+        Write-Host 'They store only a name, platform, and the path to a cookies.txt you export.' -ForegroundColor DarkGray
+        Write-Host ''
+        $profiles = @(Read-AccountProfiles)
+        if ($profiles.Count -eq 0) {
+            Write-Host '  (no profiles yet)' -ForegroundColor DarkGray
+        } else {
+            for ($i = 0; $i -lt $profiles.Count; $i++) {
+                $exists = if (Test-Path -LiteralPath $profiles[$i].CookieFile -PathType Leaf) { '' } else { '  [file missing]' }
+                Write-Host ('  {0}. {1} ({2}){3}' -f ($i + 1), $profiles[$i].Name, (Get-PlatformDisplayName $profiles[$i].Platform), $exists)
+            }
+        }
+        Write-Host ''
+        Write-Host '  A. Add a profile'
+        if ($profiles.Count -gt 0) { Write-Host '  R. Remove a profile' }
+        Write-Host '  B. Back'
+        Write-Host ''
+        $choice = (Read-Host 'Choose an option [B]').Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'B' }
+        switch ($choice) {
+            'A' { Add-AccountProfileInteractive }
+            'R' {
+                if ($profiles.Count -eq 0) { continue }
+                $sel = (Read-Host ('Remove which number? [1-{0}], blank to cancel' -f $profiles.Count)).Trim()
+                $index = 0
+                if ([int]::TryParse($sel, [ref]$index) -and $index -ge 1 -and $index -le $profiles.Count) {
+                    $remaining = @($profiles | Where-Object { $_ -ne $profiles[$index - 1] })
+                    Write-AccountProfiles -Profiles $remaining
+                    Write-Host 'Profile removed.' -ForegroundColor Green
+                    Start-Sleep -Seconds 1
+                }
+            }
+            'B' { return }
+            default { }
+        }
+    }
+}
+
+function Add-AccountProfileInteractive {
+    Clear-Terminal
+    Write-Heading -Text 'Add account profile'
+    Write-Host 'Export a Netscape-format cookies.txt from your browser while signed in, then' -ForegroundColor DarkGray
+    Write-Host 'point to that file here. Cookie values are never stored by this app.' -ForegroundColor DarkGray
+    Write-Host ''
+    $platforms = @(Get-SocialPostPlatforms)
+    $options = foreach ($p in $platforms) {
+        [pscustomobject]@{ Key = [string]([array]::IndexOf($platforms, $p) + 1); Label = (Get-PlatformDisplayName $p); Value = $p }
+    }
+    $platform = Read-MenuChoice -Title 'Which platform is this account for?' -Options $options
+    if ($null -eq $platform) { return }
+
+    $name = (Read-Host 'Friendly name (e.g. "My IG")').Trim()
+    if ([string]::IsNullOrWhiteSpace($name)) { Write-Host 'Cancelled.' -ForegroundColor Yellow; Start-Sleep -Seconds 1; return }
+
+    $path = (Read-Host 'Full path to the cookies.txt file').Trim().Trim('"')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        Write-Host 'That file was not found. Nothing was saved.' -ForegroundColor Red
+        Pause-Terminal
+        return
+    }
+    if ($null -eq (New-FilteredCookieFile -SourcePath $path -Platform $platform)) {
+        Write-Host ('That file has no {0} cookies, or could not be read/secured. Nothing was saved.' -f (Get-PlatformDisplayName $platform)) -ForegroundColor Red
+        Pause-Terminal
+        return
+    }
+    # New-FilteredCookieFile created a temp copy just to validate; sweep it away.
+    Clear-StaleCookieFiles
+
+    $profiles = @(Read-AccountProfiles)
+    $profiles += [pscustomobject]@{ Name = $name; Platform = $platform; CookieFile = $path }
+    Write-AccountProfiles -Profiles $profiles
+    Write-Host 'Profile saved.' -ForegroundColor Green
+    Start-Sleep -Seconds 1
+}
+
+# Review and release platform holds. Releasing never starts a download.
+function Show-BlockedPlatformsMenu {
+    while ($true) {
+        Clear-Terminal
+        Write-Heading -Text 'Blocked platforms'
+        $holds = Read-PlatformHolds
+        $names = @($holds.Keys)
+        if ($names.Count -eq 0) {
+            Write-Host 'No platforms are on hold.' -ForegroundColor Green
+            Pause-Terminal
+            return
+        }
+        for ($i = 0; $i -lt $names.Count; $i++) {
+            $h = $holds[$names[$i]]
+            $reason = Get-PropertyValue -InputObject $h -Name 'reason'
+            $retry = Get-PropertyValue -InputObject $h -Name 'retryAfter'
+            $suffix = if ($retry) { ('  (retry after {0})' -f $retry) } else { '' }
+            Write-Host ('  {0}. {1} - {2}{3}' -f ($i + 1), (Get-PlatformDisplayName $names[$i]), $reason, $suffix)
+        }
+        Write-Host ''
+        Write-Host '  Releasing a hold does not start any download; it only re-enables the platform.' -ForegroundColor DarkGray
+        Write-Host '  R. Release a hold'
+        Write-Host '  B. Back'
+        Write-Host ''
+        $choice = (Read-Host 'Choose an option [B]').Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'B' }
+        if ($choice -eq 'B') { return }
+        if ($choice -eq 'R') {
+            $sel = (Read-Host ('Release which number? [1-{0}], blank to cancel' -f $names.Count)).Trim()
+            $index = 0
+            if ([int]::TryParse($sel, [ref]$index) -and $index -ge 1 -and $index -le $names.Count) {
+                $hold = $holds[$names[$index - 1]]
+                $retry = Get-PropertyValue -InputObject $hold -Name 'retryAfter'
+                if ($retry) {
+                    $when = [datetime]::MinValue
+                    if ([datetime]::TryParse([string]$retry, [ref]$when) -and (Get-Date) -lt $when) {
+                        $confirm = (Read-Host ('This platform asked to wait until {0}. Release anyway? [y/N]' -f $retry)).Trim().ToUpperInvariant()
+                        if ($confirm -notin @('Y', 'YES')) { continue }
+                    }
+                }
+                Remove-PlatformHold -Platform $names[$index - 1]
+                Write-Host 'Hold released.' -ForegroundColor Green
                 Start-Sleep -Seconds 1
             }
         }
@@ -1829,63 +2162,804 @@ function Install-FfmpegLocal {
     return $succeeded
 }
 
+# ===========================================================================
+#  Social-post engine (gallery-dl)
+# ===========================================================================
+
+# Map a URL to a known platform key, or $null when unrecognised. Host-based so
+# query strings and paths do not affect detection.
+function Get-UrlPlatform {
+    param([string]$Url)
+    $parsed = $null
+    if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$parsed)) { return $null }
+    $h = $parsed.Host.ToLowerInvariant()
+    if ($h.StartsWith('www.')) { $h = $h.Substring(4) }
+    switch -Regex ($h) {
+        '(^|\.)instagram\.com$'                 { return 'instagram' }
+        '(^|\.)(tiktok\.com|vm\.tiktok\.com)$'  { return 'tiktok' }
+        '(^|\.)(x\.com|twitter\.com)$'          { return 'x' }
+        '(^|\.)(facebook\.com|fb\.watch|fb\.com)$' { return 'facebook' }
+        '(^|\.)(youtube\.com|youtu\.be)$'       { return 'youtube' }
+        default { return $null }
+    }
+}
+
+function Get-PlatformDisplayName {
+    param([string]$Platform)
+    switch ($Platform) {
+        'instagram' { 'Instagram' }
+        'tiktok'    { 'TikTok' }
+        'x'         { 'X' }
+        'facebook'  { 'Facebook' }
+        'youtube'   { 'YouTube' }
+        default     { if ([string]::IsNullOrEmpty($Platform)) { 'Unknown' } else { $Platform } }
+    }
+}
+
+# Best-effort stable post id from a single-post URL, used for the output folder.
+# Deterministic (no network) so the destination never depends on remote titles.
+# Returns $null when no id pattern matches; callers fall back to the request id.
+function Get-PostIdFromUrl {
+    param([string]$Url, [string]$Platform)
+    $parsed = $null
+    if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$parsed)) { return $null }
+    $path = $parsed.AbsolutePath
+    switch ($Platform) {
+        'x'         { if ($path -match '/status/(\d+)') { return $matches[1] } }
+        'tiktok'    {
+            if ($path -match '/(?:video|photo)/(\d+)') { return $matches[1] }
+            if ($path -match '^/([A-Za-z0-9]+)/?$') { return $matches[1] }  # vm.tiktok.com short code
+        }
+        'instagram' { if ($path -match '/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)') { return $matches[1] } }
+        'facebook'  {
+            if ($path -match '/(?:videos|reel)/(\d+)') { return $matches[1] }
+            if ($path -match '/posts/([A-Za-z0-9]+)') { return $matches[1] }
+            $query = $parsed.Query.TrimStart('?')
+            foreach ($pair in ($query -split '&')) {
+                $kv = $pair -split '=', 2
+                if ($kv.Count -eq 2 -and $kv[0] -in @('story_fbid', 'v', 'fbid') -and $kv[1]) {
+                    return [System.Uri]::UnescapeDataString($kv[1])
+                }
+            }
+        }
+    }
+    return $null
+}
+
+# Reject URL forms that address a collection (profile, feed, album, stories) rather
+# than a single post. Entire-post mode must never silently expand to these.
+function Test-IsCollectionUrl {
+    param([string]$Url, [string]$Platform)
+    $parsed = $null
+    if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$parsed)) { return $false }
+    $path = $parsed.AbsolutePath.TrimEnd('/')
+    switch ($Platform) {
+        'instagram' {
+            if ($path -match '^/(explore|reels/audio|directory)') { return $true }
+            if ($path -match '^/stories/') { return $true }
+            # A bare "/username" (no /p//reel//tv/ segment) is a profile.
+            if ($path -match '^/[^/]+$' -and $path -notmatch '^/(p|reel|reels|tv)$') { return $true }
+        }
+        'x' {
+            if ($path -match '^/[^/]+$') { return $true }                       # profile
+            if ($path -match '^/[^/]+/(media|likes|with_replies|following|followers)$') { return $true }
+            if ($path -match '^/i/lists/') { return $true }
+        }
+        'tiktok' {
+            if ($path -match '^/@[^/]+$') { return $true }                      # profile
+            if ($path -match '^/(foryou|following|explore)$') { return $true }
+            if ($path -match '/@[^/]+/(playlist|collection)') { return $true }
+        }
+        'facebook' {
+            if ($path -match '^/(groups|watch|marketplace|profile\.php)$') { return $true }
+            if ($path -match '^/[^/]+$' -and $path -notmatch '^/(watch|reel)$') { return $true }  # page/profile
+        }
+    }
+    return $false
+}
+
+# Platforms enabled for entire-post mode. All four ship in this release; gated
+# platforms simply need a cookie profile to succeed.
+function Get-SocialPostPlatforms {
+    return @('instagram', 'tiktok', 'x', 'facebook')
+}
+
+# Pinned gallery-dl release. Codeberg publishes no checksum file, so Sha256 is
+# empty by default: Install-GalleryDl then records and fingerprints the binary on
+# first download (trust-on-first-use). Set Sha256 to enforce strict verification.
+function Get-GalleryDlRelease {
+    return [pscustomobject]@{
+        Version = '1.32.13'
+        Url     = 'https://codeberg.org/mikf/gallery-dl/releases/download/v1.32.13/gallery-dl.exe'
+        Sha256  = ''
+    }
+}
+
+function Get-GalleryDlVersion {
+    if (-not (Test-Path -LiteralPath $script:GalleryDl -PathType Leaf)) { return $null }
+    try {
+        $output = & $script:GalleryDl --version 2>$null
+        return ([string]$output).Trim()
+    } catch { return $null }
+}
+
+function Test-GalleryDlReady {
+    if (-not (Test-Path -LiteralPath $script:GalleryDl -PathType Leaf)) {
+        Write-Host 'gallery-dl was not found beside this script.' -ForegroundColor Yellow
+        Write-Host 'It downloads photos and mixed-media social posts.' -ForegroundColor Yellow
+        if (Install-GalleryDl) {
+            Write-Host 'gallery-dl is ready.' -ForegroundColor Green
+        } else {
+            Write-Host 'Setup was not completed. Entire-post downloads are unavailable until gallery-dl is installed.' -ForegroundColor Yellow
+            Pause-Terminal
+            return $false
+        }
+    }
+    return $true
+}
+
+# Fetch gallery-dl, verify integrity, smoke-test, and place it beside the script.
+# Any existing binary is preserved until the replacement passes its smoke test.
+function Install-GalleryDl {
+    Write-Host ''
+    Write-Host 'gallery-dl can be downloaded (about 22 MB) straight into this folder - no install needed.' -ForegroundColor Cyan
+    $answer = (Read-Host 'Download gallery-dl now? [Y]es / [N]o').Trim().ToUpperInvariant()
+    if ($answer -notin @('', 'Y', 'YES')) { return $false }
+
+    $release = Get-GalleryDlRelease
+    $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('gallery-dl-{0}.exe' -f ([guid]::NewGuid().ToString('N')))
+    $succeeded = $false
+    $previousProgress = $ProgressPreference
+    try {
+        Write-Host ('Downloading gallery-dl {0}...' -f $release.Version) -ForegroundColor DarkGray
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $release.Url -OutFile $temp -UseBasicParsing
+        $ProgressPreference = $previousProgress
+
+        $hash = (Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($release.Sha256)) {
+            if ($hash -ne $release.Sha256.ToLowerInvariant()) {
+                Write-Host 'Downloaded gallery-dl failed SHA-256 verification; discarding it.' -ForegroundColor Red
+                return $false
+            }
+            Write-Host 'SHA-256 verified.' -ForegroundColor DarkGray
+        } else {
+            Write-Host ('SHA-256 (record to pin): {0}' -f $hash) -ForegroundColor DarkGray
+        }
+
+        # Smoke-test the fresh binary before it replaces any existing one.
+        $version = $null
+        try { $version = (& $temp --version 2>$null | Select-Object -First 1) } catch { $version = $null }
+        if ([string]::IsNullOrWhiteSpace([string]$version)) {
+            Write-Host 'The downloaded gallery-dl did not run; keeping the previous setup.' -ForegroundColor Red
+            return $false
+        }
+
+        Copy-Item -LiteralPath $temp -Destination $script:GalleryDl -Force
+        $succeeded = Test-Path -LiteralPath $script:GalleryDl -PathType Leaf
+    } catch {
+        Write-Host ('gallery-dl download failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    } finally {
+        $ProgressPreference = $previousProgress
+        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+    }
+    return $succeeded
+}
+
+# Default request-pacing (seconds) per platform. Instagram's 6-12s window is the
+# only upstream-documented value; the rest are product defaults, not safety limits.
+function Get-PlatformSleepRequest {
+    param([string]$Platform)
+    switch ($Platform) {
+        'instagram' { return @(6, 12) }
+        default     { return @(3, 6) }
+    }
+}
+
+# Build a temporary gallery-dl config file for one request and return its path.
+# The caller deletes it after the run. Pacing, retry budgets, the flat output
+# folder, and (when supplied) the cookie file all live here rather than on the
+# command line.
+function New-GalleryDlConfigFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Platform,
+        [string]$CookiePath
+    )
+    $sleep = Get-PlatformSleepRequest -Platform $Platform
+    $extractor = [ordered]@{
+        'directory'     = @()                        # flat: no per-extractor subfolders
+        'sleep-request' = $sleep
+        'retries'       = 2                          # native transient retries, capped
+    }
+    if (-not [string]::IsNullOrWhiteSpace($CookiePath)) {
+        $extractor['cookies'] = $CookiePath
+    }
+    $config = [ordered]@{
+        extractor  = $extractor
+        downloader = [ordered]@{
+            retries = 2
+            ytdl    = [ordered]@{
+                # gallery-dl delegates some video to embedded yt-dlp; point it at the
+                # bundled ffmpeg (already on PATH) for merged playback output.
+                'raw-options' = [ordered]@{ ffmpeg_location = $script:Root }
+            }
+        }
+    }
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ('gdl-config-{0}.json' -f ([guid]::NewGuid().ToString('N')))
+    ($config | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $path -Encoding UTF8
+    return $path
+}
+
+function Get-GalleryDlArguments {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$DestDir,
+        [Parameter(Mandatory = $true)][string]$Url
+    )
+    # --config-ignore: use only our generated config, never the user's ~/.gallery-dl.conf.
+    # -D sets the exact (flat) destination directory for this post.
+    return @('--config-ignore', '--config', $ConfigPath, '-D', $DestDir, '--', $Url)
+}
+
+# Social media shares one folder per date and platform: Downloads/<date>/<platform>.
+function Get-SocialPostFolder {
+    param([datetime]$StartedAt, [string]$Platform, [string]$PostId, [string]$RequestId)
+    return Join-Path (Join-Path $script:DownloadsRoot $StartedAt.ToString('yyyy-MM-dd')) $Platform
+}
+
+# ---- Per-request manifest (durable item record) ----------------------------
+
+function Get-ManifestPath {
+    param([string]$TargetFolder, [string]$RequestId)
+    $name = if ($RequestId) { 'manifest-{0}.json' -f $RequestId } else { 'manifest.json' }
+    return Join-Path $TargetFolder $name
+}
+
+function New-ManifestItem {
+    param([int]$Order, [System.IO.FileInfo]$File, [string]$MediaType, [string]$Provenance = 'gallery-dl')
+    return [ordered]@{
+        order      = $Order
+        path       = (Get-RelativeDisplayPath -Path $File.FullName)
+        sizeBytes  = [long]$File.Length
+        mediaType  = $MediaType
+        provenance = $Provenance
+    }
+}
+
+# Write the manifest atomically (temp file + move) so a crash never leaves a
+# half-written record.
+function Write-RequestManifest {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][object]$Manifest)
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $temp = '{0}.{1}.tmp' -f $Path, ([guid]::NewGuid().ToString('N'))
+    ($Manifest | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $temp -Encoding UTF8
+    Move-Item -LiteralPath $temp -Destination $Path -Force
+}
+
+function Read-RequestManifest {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try { return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json) } catch { return $null }
+}
+
+function Get-MediaTypeForFile {
+    param([System.IO.FileInfo]$File)
+    if ($script:ImageExtensions -contains $File.Extension.ToLowerInvariant()) { return 'image' }
+    return 'video'
+}
+
+# Signals that a platform is actively blocking/challenging us. Heuristic: no
+# wrapper can guarantee interception before the engine emits the error, so this
+# only drives the observable stop + hold, never a completeness claim.
+function Test-BlockingSignal {
+    param([string]$Line)
+    if ([string]::IsNullOrEmpty($Line)) { return $false }
+    return ($Line -match '(?i)\b(429|rate.?limit|too many requests|temporarily blocked|challenge_required|checkpoint_required|login[_ ]required|please wait a few minutes|account has been)\b')
+}
+
+function New-SocialPostRequest {
+    param([Parameter(Mandatory = $true)][string]$Url, [AllowNull()][object]$Account, [switch]$IncludeManifest)
+    $platform = Get-UrlPlatform -Url $Url
+    if ($null -eq $platform -or $platform -eq 'youtube') {
+        Write-Host 'Entire-post mode supports Instagram, TikTok, X, and Facebook links.' -ForegroundColor Red
+        if ($platform -eq 'youtube') { Write-Host 'Use Video / audio mode for YouTube.' -ForegroundColor Yellow }
+        Pause-Terminal
+        return $null
+    }
+    if ($platform -notin (Get-SocialPostPlatforms)) {
+        Write-Host ('{0} is not available in entire-post mode yet.' -f (Get-PlatformDisplayName -Platform $platform)) -ForegroundColor Red
+        Pause-Terminal
+        return $null
+    }
+    if (Test-IsCollectionUrl -Url $Url -Platform $platform) {
+        Write-Host 'That link points to a profile, feed, or album, not a single post.' -ForegroundColor Red
+        Write-Host 'Entire-post mode downloads one post at a time. Paste a single post/reel/photo link.' -ForegroundColor Yellow
+        Pause-Terminal
+        return $null
+    }
+
+    $startedAt = Get-Date
+    $requestId = [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $postId = Get-PostIdFromUrl -Url $Url -Platform $platform
+    $targetFolder = Get-SocialPostFolder -StartedAt $startedAt -Platform $platform -PostId $postId -RequestId $requestId
+
+    return [pscustomobject]@{
+        Url          = $Url
+        Title        = ''
+        Mode         = 'SocialPost'
+        IncludeManifest = [bool]$IncludeManifest
+        Engine       = 'gallery-dl'
+        Platform     = $platform
+        Account      = $Account
+        RequestId    = $requestId
+        PostId       = $postId
+        TargetFolder = $targetFolder
+        Status       = 'Pending'
+        # Placeholder yt-dlp fields keep shared history/display code total.
+        Preset       = 'post'
+        Quality      = 'best'
+        PlaylistMode = 'Single'
+        LiveDecision = [pscustomobject]@{ Enabled = $false; Description = 'n/a' }
+    }
+}
+
+# Execute one entire-post request with gallery-dl. Mirrors Invoke-YtDlpRequest's
+# history/records contract but records durable item identities via the manifest.
+function Invoke-SocialPostRequest {
+    param([Parameter(Mandatory = $true)][object]$Request, [switch]$Queued, [string]$QueueLabel = '')
+    $url = $Request.Url
+    $platform = $Request.Platform
+    $targetFolder = $Request.TargetFolder
+    $startedAt = Get-Date
+    if (-not (Test-Path -LiteralPath $targetFolder)) {
+        [void](New-Item -ItemType Directory -Path $targetFolder -Force)
+    }
+    $before = Get-FileSnapshot -Path $targetFolder
+
+    # Phase 3 resolves a temporary filtered cookie copy from $Request.Account.
+    $cookiePath = Resolve-RequestCookiePath -Request $Request
+    $configPath = $null
+    $exitCode = 1
+    $interrupted = $false
+    $script:SocialBlockingHit = $false
+
+    Clear-Terminal
+    Write-Heading -Text $(if ($QueueLabel) { "Downloading $QueueLabel" } else { 'Downloading post' })
+    Write-Host ('{0} post' -f (Get-PlatformDisplayName -Platform $platform))
+    Write-Host $url
+    Write-Host ('Destination: {0}' -f (Get-RelativeDisplayPath -Path $targetFolder))
+    if ($null -ne $Request.Account) {
+        Write-Host ('Account: {0}' -f $Request.Account.Name) -ForegroundColor DarkGray
+    }
+    Write-Host 'Press Ctrl+C once if you need to interrupt the download.' -ForegroundColor DarkGray
+    Write-Host ''
+
+    try {
+        $configPath = New-GalleryDlConfigFile -Platform $platform -CookiePath $cookiePath
+        $arguments = Get-GalleryDlArguments -ConfigPath $configPath -DestDir $targetFolder -Url $url
+        $processResult = Invoke-MediaProcess -ExecutablePath $script:GalleryDl -Arguments $arguments -OnOutput {
+            param([string]$line)
+            if (Test-BlockingSignal -Line $line) { $script:SocialBlockingHit = $true }
+            Write-Host $line
+        }
+        $exitCode = $processResult.ExitCode
+        $interrupted = $processResult.Interrupted
+        if ($exitCode -in @(130, -1073741510)) { $interrupted = $true }
+    } catch [System.Management.Automation.PipelineStoppedException] {
+        $interrupted = $true
+        $exitCode = 130
+    } catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        $exitCode = 1
+    } finally {
+        if (-not [string]::IsNullOrWhiteSpace($configPath) -and (Test-Path -LiteralPath $configPath)) {
+            Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue
+        }
+        Remove-TemporaryCookieFile -Path $cookiePath
+    }
+
+    # Only finalized files are recorded; gallery-dl writes final names directly, so
+    # a folder diff of media+image files is the durable evidence of completion.
+    $completedFiles = @(Get-NewOrChangedFiles -Path $targetFolder -Before $before | Sort-Object FullName)
+    $status = Get-SocialPostStatus -ExitCode $exitCode -Interrupted $interrupted -Blocked $script:SocialBlockingHit -CompletedCount $completedFiles.Count
+
+    # Durable per-request manifest.
+    $items = New-Object System.Collections.Generic.List[object]
+    $order = 0
+    foreach ($file in $completedFiles) {
+        $order++
+        $items.Add((New-ManifestItem -Order $order -File $file -MediaType (Get-MediaTypeForFile -File $file)))
+    }
+    $manifest = [ordered]@{
+        manifestVersion = 1
+        requestId       = $Request.RequestId
+        url             = $url
+        platform        = $platform
+        postId          = $Request.PostId
+        mode            = 'SocialPost'
+        status          = $status
+        expectedCount   = $null            # gallery-dl gives no reliable pre-count
+        enumerationFinished = ($exitCode -eq 0)
+        engineVersions  = [ordered]@{ 'gallery-dl' = (Get-GalleryDlVersion) }
+        downloadedCount = $completedFiles.Count
+        items           = $items.ToArray()
+        recordedAtLocal = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+    }
+    if (Get-PropertyValue -InputObject $Request -Name 'IncludeManifest') {
+        try { Write-RequestManifest -Path (Get-ManifestPath -TargetFolder $targetFolder -RequestId $Request.RequestId) -Manifest $manifest }
+        catch { Write-Host ('Could not write the post manifest: {0}' -f $_.Exception.Message) -ForegroundColor Red }
+    }
+
+    # History rows reuse the unchanged CSV columns.
+    $historyRows = New-Object System.Collections.Generic.List[object]
+    $historyStatus = switch ($status) {
+        'Completed'   { 'Completed' }
+        'Partial'     { 'Partial' }
+        'Blocked'     { 'Blocked' }
+        'Interrupted' { 'Interrupted' }
+        default       { 'Failed (exit {0})' -f $exitCode }
+    }
+    foreach ($file in $completedFiles) {
+        $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset ('post/{0}' -f $platform) -LiveMode 'n/a' -PlaylistMode 'Single' -Status $historyStatus -File $file))
+    }
+    if ($completedFiles.Count -eq 0) {
+        $historyRows.Add((New-HistoryRow -Timestamp $startedAt -Url $url -Preset ('post/{0}' -f $platform) -LiveMode 'n/a' -PlaylistMode 'Single' -Status $historyStatus -File $null))
+    }
+    try { Add-HistoryRows -Rows $historyRows.ToArray() }
+    catch { Write-Host ('Could not update download history: {0}' -f $_.Exception.Message) -ForegroundColor Red }
+
+    if ($script:SocialBlockingHit) {
+        Set-PlatformHold -Platform $platform -Reason 'Rate limit or account challenge detected.'
+    }
+
+    if (-not $Queued) {
+        Write-Heading -Text 'Download result'
+        switch ($status) {
+            'Completed'   { Write-Host ('Downloaded {0} item(s).' -f $completedFiles.Count) -ForegroundColor Green }
+            'Partial'     { Write-Host ('Partial: downloaded {0} item(s) before the download stopped.' -f $completedFiles.Count) -ForegroundColor Yellow }
+            'Blocked'     { Write-Host ('{0} is temporarily blocking downloads. It has been put on hold.' -f (Get-PlatformDisplayName -Platform $platform)) -ForegroundColor Red }
+            'Interrupted' { Write-Host 'The download was interrupted.' -ForegroundColor Yellow }
+            default       { Write-Host ('gallery-dl failed with exit code {0}.' -f $exitCode) -ForegroundColor Red }
+        }
+        Show-FileList -Files $completedFiles -IncludeTotal
+    }
+    if ($status -eq 'Completed' -and $script:Settings.OpenFolderAfterDownload -and $completedFiles.Count -gt 0) {
+        Open-DownloadLocation -Files $completedFiles -TargetFolder $targetFolder
+    }
+    if (-not $Queued) { Pause-Terminal }
+    return [pscustomobject]@{ Status = $status; ExitCode = $exitCode }
+}
+
+# Map raw engine outcome to the queue state model.
+function Get-SocialPostStatus {
+    param([int]$ExitCode, [bool]$Interrupted, [bool]$Blocked, [int]$CompletedCount)
+    if ($Blocked) { return 'Blocked' }
+    if ($Interrupted) { return 'Interrupted' }
+    if ($ExitCode -eq 0 -and $CompletedCount -gt 0) { return 'Completed' }
+    if ($CompletedCount -gt 0) { return 'Partial' }
+    # Nothing was downloaded (including an exit-0 "empty success"): treat as a
+    # retryable failure rather than claiming completion with zero items.
+    return 'Failed'
+}
+
+# ===========================================================================
+#  Authentication (user-supplied Netscape cookie files)
+# ===========================================================================
+
+# Filename prefix for our temporary, permission-restricted cookie copies. A
+# function (not a script var) so every function-loaded test harness sees it.
+function Get-CookieTempPrefix { return 'seen-dl-cookies-' }
+
+# Cookie domains kept when filtering a user cookie file down to one platform.
+function Get-PlatformCookieDomains {
+    param([string]$Platform)
+    switch ($Platform) {
+        'instagram' { @('instagram.com', 'cdninstagram.com') }
+        'tiktok'    { @('tiktok.com', 'tiktokcdn.com') }
+        'x'         { @('x.com', 'twitter.com') }
+        'facebook'  { @('facebook.com', 'fbcdn.net', 'fb.com') }
+        default     { @() }
+    }
+}
+
+# Restrict a file to the current user only. Best-effort: failure to tighten the
+# ACL must not leak the file, so the caller treats a failure as fatal for the copy.
+function Restrict-FilePermissions {
+    param([string]$Path)
+    try {
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        & icacls $Path /inheritance:r /grant:r ("{0}:F" -f $me) *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
+# Build a temp cookie file containing only the platform's cookie lines, preserving
+# Netscape domain/path/expiry semantics. Returns the temp path, or $null on any
+# problem (the original file is never modified).
+function New-FilteredCookieFile {
+    param([string]$SourcePath, [string]$Platform)
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) { return $null }
+    $domains = Get-PlatformCookieDomains -Platform $Platform
+    if ($domains.Count -eq 0) { return $null }
+    try {
+        $lines = Get-Content -LiteralPath $SourcePath -ErrorAction Stop
+    } catch { return $null }
+
+    $kept = New-Object System.Collections.Generic.List[string]
+    $kept.Add('# Netscape HTTP Cookie File')
+    $matched = 0
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line.StartsWith('#') -and -not $line.StartsWith('#HttpOnly_')) { continue }
+        $domainField = ($line -split "`t")[0].TrimStart('#').TrimStart('.').ToLowerInvariant()
+        foreach ($d in $domains) {
+            if ($domainField -eq $d -or $domainField.EndsWith('.' + $d)) {
+                $kept.Add($line); $matched++; break
+            }
+        }
+    }
+    if ($matched -eq 0) { return $null }
+
+    $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('{0}{1}.txt' -f (Get-CookieTempPrefix), ([guid]::NewGuid().ToString('N')))
+    try {
+        Set-Content -LiteralPath $temp -Value $kept -Encoding ASCII -ErrorAction Stop
+    } catch { return $null }
+    if (-not (Restrict-FilePermissions -Path $temp)) {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    return $temp
+}
+
+# Resolve the cookie file to hand the engine for a request. Anonymous requests
+# return $null. Authenticated requests must have an establishable, matching
+# platform, or they are refused (credentials are never sent to an unknown host).
+function Resolve-RequestCookiePath {
+    param([object]$Request)
+    $account = Get-PropertyValue -InputObject $Request -Name 'Account'
+    if ($null -eq $account) { return $null }
+    $platform = Get-PropertyValue -InputObject $Request -Name 'Platform'
+    if ([string]::IsNullOrEmpty($platform)) { $platform = Get-UrlPlatform -Url $Request.Url }
+    if ([string]::IsNullOrEmpty($platform)) {
+        throw 'Cannot establish the platform for an authenticated request; refusing to send cookies.'
+    }
+    $accountPlatform = Get-PropertyValue -InputObject $account -Name 'Platform'
+    if ($accountPlatform -and $accountPlatform -ne $platform) {
+        throw ('The selected account is for {0}, not {1}.' -f (Get-PlatformDisplayName $accountPlatform), (Get-PlatformDisplayName $platform))
+    }
+    $cookieFile = Get-PropertyValue -InputObject $account -Name 'CookieFile'
+    $filtered = New-FilteredCookieFile -SourcePath $cookieFile -Platform $platform
+    if ($null -eq $filtered) {
+        throw 'The cookie file could not be read, contained no cookies for this platform, or could not be secured.'
+    }
+    return $filtered
+}
+
+# Delete a temporary cookie copy we created. Never touches anything outside our
+# temp prefix, so a user's original file can never be removed by accident.
+function Remove-TemporaryCookieFile {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $name = Split-Path -Leaf $Path
+    if ($name.StartsWith((Get-CookieTempPrefix)) -and (Test-Path -LiteralPath $Path)) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Remove any application-owned temporary cookie copies left by a prior crash.
+function Clear-StaleCookieFiles {
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    Get-ChildItem -LiteralPath $tempRoot -Filter ('{0}*' -f (Get-CookieTempPrefix)) -File -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+}
+
+# ===========================================================================
+#  Platform holds (persisted across restarts)
+# ===========================================================================
+
+function Get-HoldStorePath {
+    if (-not (Test-Path variable:script:LogsRoot)) { return $null }
+    return (Join-Path $script:LogsRoot 'platform-holds.json')
+}
+
+function Read-PlatformHolds {
+    $path = Get-HoldStorePath
+    if ([string]::IsNullOrEmpty($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return @{} }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        $map = @{}
+        foreach ($p in $raw.PSObject.Properties) { $map[$p.Name] = $p.Value }
+        return $map
+    } catch { return @{} }
+}
+
+function Write-PlatformHolds {
+    param([hashtable]$Holds)
+    if (-not (Test-Path -LiteralPath $script:LogsRoot)) { [void](New-Item -ItemType Directory -Path $script:LogsRoot -Force) }
+    $path = Get-HoldStorePath
+    $temp = '{0}.{1}.tmp' -f $path, ([guid]::NewGuid().ToString('N'))
+    ($Holds | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $temp -Encoding UTF8
+    Move-Item -LiteralPath $temp -Destination $path -Force
+}
+
+function Set-PlatformHold {
+    param([string]$Platform, [string]$Reason = '', [datetime]$RetryAfter)
+    $holds = Read-PlatformHolds
+    $entry = [ordered]@{
+        reason  = $Reason
+        heldAt  = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+    }
+    if ($PSBoundParameters.ContainsKey('RetryAfter')) {
+        $entry['retryAfter'] = $RetryAfter.ToString('yyyy-MM-ddTHH:mm:sszzz')
+    }
+    $holds[$Platform] = [pscustomobject]$entry
+    Write-PlatformHolds -Holds $holds
+}
+
+function Get-PlatformHold {
+    param([string]$Platform)
+    $holds = Read-PlatformHolds
+    if ($holds.ContainsKey($Platform)) { return $holds[$Platform] }
+    return $null
+}
+
+function Remove-PlatformHold {
+    param([string]$Platform)
+    $holds = Read-PlatformHolds
+    if ($holds.ContainsKey($Platform)) {
+        $holds.Remove($Platform)
+        Write-PlatformHolds -Holds $holds
+    }
+}
+
+# A platform is held only until its recorded retry-after time passes; an expired
+# hold is cleared automatically so work can resume.
+function Test-PlatformHeld {
+    param([string]$Platform)
+    $hold = Get-PlatformHold -Platform $Platform
+    if ($null -eq $hold) { return $false }
+    $retryAfter = Get-PropertyValue -InputObject $hold -Name 'retryAfter'
+    if ($retryAfter) {
+        $when = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$retryAfter, [ref]$when) -and (Get-Date) -ge $when) {
+            Remove-PlatformHold -Platform $Platform
+            return $false
+        }
+    }
+    return $true
+}
+
+# ---- Account profile store -------------------------------------------------
+# Profiles store only a friendly name, platform, and cookie-file path. Cookie
+# values are never persisted here or anywhere else in the application.
+
+function Get-ProfileStorePath {
+    if (-not (Test-Path variable:script:LogsRoot)) { return $null }
+    return (Join-Path $script:LogsRoot 'account-profiles.json')
+}
+
+function Read-AccountProfiles {
+    $path = Get-ProfileStorePath
+    if ([string]::IsNullOrEmpty($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return @() }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        return @($raw | ForEach-Object {
+            [pscustomobject]@{
+                Name       = [string]$_.Name
+                Platform   = [string]$_.Platform
+                CookieFile = [string]$_.CookieFile
+            }
+        })
+    } catch { return @() }
+}
+
+function Write-AccountProfiles {
+    param([object[]]$Profiles)
+    if (-not (Test-Path -LiteralPath $script:LogsRoot)) { [void](New-Item -ItemType Directory -Path $script:LogsRoot -Force) }
+    $path = Get-ProfileStorePath
+    $temp = '{0}.{1}.tmp' -f $path, ([guid]::NewGuid().ToString('N'))
+    (,@($Profiles) | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $temp -Encoding UTF8
+    Move-Item -LiteralPath $temp -Destination $path -Force
+}
+
 function Show-MainMenu {
     Clear-Terminal
     Write-Host '=============================================' -ForegroundColor Cyan
     Write-Host "          SEEN'S yt-dlp DOWNLOADER" -ForegroundColor White
     Write-Host '=============================================' -ForegroundColor Cyan
-    Write-Host '  1. Download a video, audio, live, or playlist'
+    Write-Host '  1. Download a video, audio, live, playlist, or social post'
     Write-Host '  2. Download queue'
     Write-Host '  3. View media library sizes'
     Write-Host '  4. View recorded download history'
-    Write-Host '  5. Update downloader engine (yt-dlp)'
+    Write-Host '  5. Update downloader engines (yt-dlp + gallery-dl)'
     Write-Host '  6. Settings'
     Write-Host '  7. Exit'
     Write-Host ''
 }
 
-function Initialize-DownloadDependencies {
-    Update-JsRuntimeState
-    $script:FfmpegAvailable = Test-CommandAvailable -Name 'ffmpeg'
-if (-not (Test-Path -LiteralPath $script:YtDlp -PathType Leaf)) {
-    Write-Host ('yt-dlp.exe was not found beside this script: {0}' -f $script:YtDlp) -ForegroundColor Red
-    return $false
-}
+# --- Per-mode dependency checks --------------------------------------------
+# Each check validates and, where possible, self-installs a single dependency,
+# returning $true only when the dependency is ready. Resolve-RequestDependencies
+# composes just the checks a given mode needs, so entire-post (gallery-dl) mode
+# does not require the standalone yt-dlp executable or a JavaScript runtime.
 
-if ($null -eq $script:JsRuntime) {
-    Write-Host 'No JavaScript runtime was found on PATH.' -ForegroundColor Red
-    Write-Host 'yt-dlp needs Node.js (or Deno) to extract YouTube and many other sites.' -ForegroundColor Red
-    if (Install-NodeRuntime) {
-        Update-JsRuntimeState
-    }
-    if ($null -eq $script:JsRuntime) {
-        Write-Host ''
-        Write-Host 'A JavaScript runtime is still not available.' -ForegroundColor Red
-        Write-Host 'Install Node.js from https://nodejs.org/, reopen a terminal, then run this again.' -ForegroundColor Yellow
-        Pause-Terminal
+function Test-YtDlpReady {
+    if (-not (Test-Path -LiteralPath $script:YtDlp -PathType Leaf)) {
+        Write-Host ('yt-dlp.exe was not found beside this script: {0}' -f $script:YtDlp) -ForegroundColor Red
         return $false
     }
-    Write-Host 'Node.js is ready.' -ForegroundColor Green
-}
-
-if (-not $script:FfmpegAvailable) {
-    Write-Host 'FFmpeg was not found on PATH.' -ForegroundColor Yellow
-    Write-Host 'It is needed for MP3/AAC audio and some high-quality video merges.' -ForegroundColor Yellow
-    if (Install-FfmpegLocal) {
-        $script:FfmpegAvailable = $true
-        Write-Host 'FFmpeg is ready.' -ForegroundColor Green
-    } else {
-        Write-Host 'Download setup was not completed. Install FFmpeg and try again; library and history remain available.' -ForegroundColor Yellow
-        Write-Host 'You can also install it yourself from https://ffmpeg.org/ and add it to PATH.' -ForegroundColor Yellow
-        Pause-Terminal
-        return $false
-    }
-}
-
     return $true
 }
 
+function Test-JsRuntimeReady {
+    Update-JsRuntimeState
+    if ($null -eq $script:JsRuntime) {
+        Write-Host 'No JavaScript runtime was found on PATH.' -ForegroundColor Red
+        Write-Host 'yt-dlp needs Node.js (or Deno) to extract YouTube and many other sites.' -ForegroundColor Red
+        if (Install-NodeRuntime) {
+            Update-JsRuntimeState
+        }
+        if ($null -eq $script:JsRuntime) {
+            Write-Host ''
+            Write-Host 'A JavaScript runtime is still not available.' -ForegroundColor Red
+            Write-Host 'Install Node.js from https://nodejs.org/, reopen a terminal, then run this again.' -ForegroundColor Yellow
+            Pause-Terminal
+            return $false
+        }
+        Write-Host 'Node.js is ready.' -ForegroundColor Green
+    }
+    return $true
+}
+
+function Test-FfmpegReady {
+    $script:FfmpegAvailable = Test-CommandAvailable -Name 'ffmpeg'
+    if (-not $script:FfmpegAvailable) {
+        Write-Host 'FFmpeg was not found on PATH.' -ForegroundColor Yellow
+        Write-Host 'It is needed for MP3/AAC audio and some high-quality video merges.' -ForegroundColor Yellow
+        if (Install-FfmpegLocal) {
+            $script:FfmpegAvailable = $true
+            Write-Host 'FFmpeg is ready.' -ForegroundColor Green
+        } else {
+            Write-Host 'Download setup was not completed. Install FFmpeg and try again; library and history remain available.' -ForegroundColor Yellow
+            Write-Host 'You can also install it yourself from https://ffmpeg.org/ and add it to PATH.' -ForegroundColor Yellow
+            Pause-Terminal
+            return $false
+        }
+    }
+    return $true
+}
+
+# Validate only the dependencies the chosen mode actually uses.
+#   VideoAudio -> yt-dlp + JavaScript runtime + FFmpeg (existing behavior)
+#   SocialPost -> gallery-dl + FFmpeg (gallery-dl check lands in Phase 2)
+function Resolve-RequestDependencies {
+    param([string]$Mode = 'VideoAudio')
+    switch ($Mode) {
+        'VideoAudio' {
+            if (-not (Test-YtDlpReady)) { return $false }
+            if (-not (Test-JsRuntimeReady)) { return $false }
+            if (-not (Test-FfmpegReady)) { return $false }
+            return $true
+        }
+        'SocialPost' {
+            if (-not (Test-GalleryDlReady)) { return $false }
+            if (-not (Test-FfmpegReady)) { return $false }
+            return $true
+        }
+        default { return $false }
+    }
+}
+
+# Backward-compatible entry point: the original full-dependency check maps to the
+# existing video/audio workflow.
+function Initialize-DownloadDependencies {
+    return (Resolve-RequestDependencies -Mode 'VideoAudio')
+}
+
 $script:Settings = Get-DownloaderSettings
+# Remove any application-owned temporary cookie copies left by a prior crash.
+Clear-StaleCookieFiles
 
 while ($true) {
     Show-MainMenu

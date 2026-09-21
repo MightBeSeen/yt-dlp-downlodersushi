@@ -36,3 +36,6 @@ cookies*.txt
 # Local shortcuts and test files
 *.lnk
 /.test-temp/
+
+# Downloaded helper binary (fetched from Codeberg by the installer/app, not stored in the repo)
+/gallery-dl.exe

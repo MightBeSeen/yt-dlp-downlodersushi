@@ -39,6 +39,7 @@ Assert (-not $result.Success -and $result.Error -match 'fixture failure') 'faile
 
 # Reproduce the original user flow with a real slow native process.
 function Initialize-DownloadDependencies { $true }
+function Read-DownloadMode { param($DefaultValue) 'VideoAudio' }
 function Read-Host { $url }
 function Read-FormatPreset { param($DefaultValue) $null }
 function Show-DownloadHeader {}

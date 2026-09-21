@@ -89,7 +89,7 @@ try {
     $InstallDir = [IO.Path]::GetFullPath($InstallDir)
     Write-Host "Install location: $InstallDir"
     Write-Host 'Close the downloader before updating. Downloads and settings will be kept.'
-    Write-Host 'Setup downloads the app, yt-dlp, Node.js LTS, and FFmpeg. This may take a few minutes.'
+    Write-Host 'Setup downloads the app, yt-dlp, Node.js LTS, FFmpeg, and gallery-dl. This may take a few minutes.'
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     try {
         $installLock = [IO.File]::Open((Join-Path $InstallDir '.setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
@@ -97,7 +97,7 @@ try {
     $stage = Join-Path $InstallDir ('.setup-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $stage | Out-Null
 
-    Write-Host "`n[1/5] Downloading the latest app from GitHub..."
+    Write-Host "`n[1/6] Downloading the latest app from GitHub..."
     $headers = @{ 'User-Agent' = 'Seen-Downloader-Setup'; Accept = 'application/vnd.github+json' }
     if ($env:GITHUB_TOKEN) { $headers.Authorization = 'Bearer ' + $env:GITHUB_TOKEN }
     $repoApi = 'https://api.github.com/repos/MightBeSeen/yt-dlp-downlodersushi'
@@ -119,13 +119,13 @@ try {
     [void][Management.Automation.Language.Parser]::ParseFile((Join-Path $stage 'smart-downloader.ps1'), [ref]$tokens, [ref]$parseErrors)
     if ($parseErrors.Count) { throw 'The downloaded app contains PowerShell syntax errors.' }
 
-    Write-Host '[2/5] Downloading the latest stable yt-dlp...'
+    Write-Host '[2/6] Downloading the latest stable yt-dlp...'
     $release = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download'
     Get-SetupFile "$release/yt-dlp.exe" (Join-Path $stage 'yt-dlp.exe')
     Get-SetupFile "$release/SHA2-256SUMS" (Join-Path $stage 'yt-checksums.txt')
     Assert-SetupHash (Join-Path $stage 'yt-dlp.exe') (Get-Content (Join-Path $stage 'yt-checksums.txt') -Raw) 'yt-dlp.exe'
 
-    Write-Host '[3/5] Downloading the latest Node.js LTS...'
+    Write-Host '[3/6] Downloading the latest Node.js LTS...'
     Get-SetupFile 'https://nodejs.org/dist/index.json' (Join-Path $stage 'node-index.json')
     $node = (Get-Content (Join-Path $stage 'node-index.json') -Raw | ConvertFrom-Json) |
         Where-Object { $_.lts -and $_.files -contains 'win-x64-zip' } | Select-Object -First 1
@@ -140,7 +140,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $nodeRoot 'node.exe') -Destination $stage
     Copy-Item -LiteralPath (Join-Path $nodeRoot 'LICENSE') -Destination (Join-Path $stage 'Node-LICENSE.txt')
 
-    Write-Host '[4/5] Downloading FFmpeg (the largest download)...'
+    Write-Host '[4/6] Downloading FFmpeg (the largest download)...'
     $ffmpegUrl = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
     Get-SetupFile $ffmpegUrl (Join-Path $stage 'ffmpeg.zip')
     Get-SetupFile "$ffmpegUrl.sha256" (Join-Path $stage 'ffmpeg-checksum.txt')
@@ -156,15 +156,26 @@ try {
     if (-not $license) { throw 'The FFmpeg license is missing from the archive.' }
     Copy-Item -LiteralPath $license.FullName -Destination (Join-Path $stage 'FFmpeg-LICENSE.txt')
 
-    Write-Host '[5/5] Checking helpers and finishing setup...'
-    foreach ($name in @('yt-dlp.exe', 'node.exe', 'ffmpeg.exe', 'ffprobe.exe')) {
+    Write-Host '[5/6] Downloading gallery-dl (photos and social posts)...'
+    # gallery-dl publishes no checksum file, so it is run-tested below rather than
+    # hash-verified. Keep this pinned version in sync with Get-GalleryDlRelease in
+    # smart-downloader.ps1.
+    $gdlVersion = 'v1.32.13'
+    Get-SetupFile "https://codeberg.org/mikf/gallery-dl/releases/download/$gdlVersion/gallery-dl.exe" (Join-Path $stage 'gallery-dl.exe')
+    Set-Content -LiteralPath (Join-Path $stage 'GalleryDl-LICENSE.txt') -Value @(
+        "gallery-dl $gdlVersion is distributed under the GNU General Public License v2.0.",
+        'Source and license: https://codeberg.org/mikf/gallery-dl'
+    ) -Encoding ASCII
+
+    Write-Host '[6/6] Checking helpers and finishing setup...'
+    foreach ($name in @('yt-dlp.exe', 'node.exe', 'ffmpeg.exe', 'ffprobe.exe', 'gallery-dl.exe')) {
         $versionArg = '--version'
         if ($name -like 'ff*') { $versionArg = '-version' }
         $version = & (Join-Path $stage $name) $versionArg 2>&1
         if ($LASTEXITCODE -ne 0) { throw "$name could not run on this PC." }
         Write-Host ('  ' + ($version | Select-Object -First 1))
     }
-    $names = $appFiles + @('yt-dlp.exe', 'node.exe', 'ffmpeg.exe', 'ffprobe.exe', 'Node-LICENSE.txt', 'FFmpeg-LICENSE.txt', 'installed-version.txt')
+    $names = $appFiles + @('yt-dlp.exe', 'node.exe', 'ffmpeg.exe', 'ffprobe.exe', 'gallery-dl.exe', 'Node-LICENSE.txt', 'FFmpeg-LICENSE.txt', 'GalleryDl-LICENSE.txt', 'installed-version.txt')
     Set-Content -LiteralPath (Join-Path $stage 'installed-version.txt') -Value $commit -Encoding ASCII
     Install-SetupFiles $stage $InstallDir $names
 
