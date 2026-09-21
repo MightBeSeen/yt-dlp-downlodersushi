@@ -2863,10 +2863,39 @@ function Write-AccountProfiles {
     Move-Item -LiteralPath $temp -Destination $path -Force
 }
 
+# Build the version label shown on the home screen. Prefers the human-friendly
+# version stamped in README.md and appends the short install revision recorded in
+# installed-version.txt, which the installer rewrites on every update. Any missing
+# piece is simply omitted, so this never blocks the menu.
+function Get-AppVersion {
+    $friendly = $null
+    $readme = Join-Path $script:Root 'README.md'
+    if (Test-Path -LiteralPath $readme -PathType Leaf) {
+        try {
+            $raw = Get-Content -LiteralPath $readme -Raw
+            $match = [regex]::Match($raw, '(?m)^\*\*Version:\*\*\s*(\S+)')
+            if ($match.Success) { $friendly = $match.Groups[1].Value }
+        } catch { }
+    }
+    $rev = $null
+    $verFile = Join-Path $script:Root 'installed-version.txt'
+    if (Test-Path -LiteralPath $verFile -PathType Leaf) {
+        try {
+            $sha = (Get-Content -LiteralPath $verFile -Raw).Trim()
+            if ($sha -match '^[0-9a-f]{7,40}$') { $rev = $sha.Substring(0, 7) }
+        } catch { }
+    }
+    if ($friendly -and $rev) { return ('v{0} (rev {1})' -f $friendly, $rev) }
+    if ($friendly) { return ('v{0}' -f $friendly) }
+    if ($rev) { return ('rev {0}' -f $rev) }
+    return 'dev build'
+}
+
 function Show-MainMenu {
     Clear-Terminal
     Write-Host '=============================================' -ForegroundColor Cyan
     Write-Host "          SEEN'S yt-dlp DOWNLOADER" -ForegroundColor White
+    Write-Host ('               {0}' -f (Get-AppVersion)) -ForegroundColor DarkGray
     Write-Host '=============================================' -ForegroundColor Cyan
     Write-Host '  1. Download a video, audio, live, playlist, or social post'
     Write-Host '  2. Download queue'
