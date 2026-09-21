@@ -37,5 +37,9 @@ cookies*.txt
 *.lnk
 /.test-temp/
 
+# Runtime data written on the user's machine by the installer / self-update
+/installed-version.txt
+/.setup.lock
+
 # Downloaded helper binary (fetched from Codeberg by the installer/app, not stored in the repo)
 /gallery-dl.exe
