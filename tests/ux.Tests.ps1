@@ -38,7 +38,7 @@ $result = Complete-MetadataProbe (Start-MetadataProbe $url)
 Assert (-not $result.Success -and $result.Error -match 'fixture failure') 'failed probe retains useful error'
 
 # Reproduce the original user flow with a real slow native process.
-function Initialize-DownloadDependencies { $true }
+function Resolve-RequestDependencies { param($Mode) $true }
 function Read-DownloadMode { param($DefaultValue) 'VideoAudio' }
 function Read-Host { $url }
 function Read-FormatPreset { param($DefaultValue) $null }
@@ -78,7 +78,7 @@ Assert ($output -match 'Failed' -and $output -notmatch 'damaged') 'zero-byte fai
 Remove-Item Function:Test-Path
 
 # Exercise setup through review; any media/directory side effect is a test failure.
-function Initialize-DownloadDependencies { $true }
+function Resolve-RequestDependencies { param($Mode) $true }
 function Start-MetadataProbe { [pscustomobject]@{} }
 function Test-MetadataProbeCompleted { $true }
 function Complete-MetadataProbe { [pscustomobject]@{Success=$true;Cancelled=$false;Metadata=[pscustomobject]@{title='Fixture';_type='video';live_status='not_live'}} }
@@ -130,7 +130,9 @@ foreach ($case in $cases) {
     Assert ($output -match $case.Expected -and $script:answers.Count -eq 0) $case.Name
 }
 
-# Dependency tests use real setup logic with installers stubbed out.
+# Dependency tests restore the real resolver with installers stubbed out.
+$resolver = $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Resolve-RequestDependencies'},$false)[0]
+. ([scriptblock]::Create($resolver.Extent.Text))
 $setup = $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Initialize-DownloadDependencies'},$false)[0]
 . ([scriptblock]::Create($setup.Extent.Text))
 function Test-Path { $true }
