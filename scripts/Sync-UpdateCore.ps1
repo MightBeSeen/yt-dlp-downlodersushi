@@ -16,15 +16,4 @@ foreach ($name in @('smart-downloader.ps1', 'Install Yt-dlp Downloader.cmd')) {
         [IO.File]::WriteAllText($path, $updated.Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
     }
 }
-# Migration shim: apps installed under the old name self-update by fetching
-# "Install Seen Downloader.cmd" from stable, so keep it as a byte-identical copy of the
-# primary installer for ONE release to let those users migrate to the Yt-dlp-named app.
-# Remove this block and the file in the next release once released users have upgraded.
-$primaryInstaller = Join-Path $root 'Install Yt-dlp Downloader.cmd'
-$legacyShim = Join-Path $root 'Install Seen Downloader.cmd'
-if ($Check) {
-    if ([IO.File]::ReadAllText($primaryInstaller) -cne [IO.File]::ReadAllText($legacyShim)) { throw 'Legacy installer shim is stale. Run scripts/Sync-UpdateCore.ps1.' }
-} else {
-    Copy-Item -LiteralPath $primaryInstaller -Destination $legacyShim -Force
-}
-Write-Host 'Shared update core is synchronized (legacy installer shim kept for migration).'
+Write-Host 'Shared update core is synchronized.'
