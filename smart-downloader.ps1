@@ -16,7 +16,7 @@ $script:GalleryDl = Join-Path $script:Root 'gallery-dl.exe'
 # which have their own update paths). Kept in sync with the network installer's list.
 $script:RepoOwnerName = 'MightBeSeen/yt-dlp-downlodersushi'
 $script:RepoBranch    = 'stable'
-$script:AppFiles      = @('smart-downloader.ps1', "Seen's yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt', 'Install Seen Downloader.cmd')
+$script:AppFiles      = @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt', 'Install Yt-dlp Downloader.cmd', "Seen's yt-dlp Downloader.cmd", 'Install Seen Downloader.cmd')
 $script:RestartRequested = $false
 
 # Make helpers that live beside the script (e.g. a downloaded ffmpeg.exe) discoverable to
@@ -335,7 +335,7 @@ $script:MediaExtensions = @(
 try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $OutputEncoding = [Console]::OutputEncoding
-    $Host.UI.RawUI.WindowTitle = "Seen's yt-dlp Downloader"
+    $Host.UI.RawUI.WindowTitle = "Yt-dlp Downloader"
 } catch {
     # Some redirected/non-interactive hosts do not expose console settings.
 }
@@ -2085,7 +2085,7 @@ function Show-DownloadHistory {
     if (-not (Test-Path -LiteralPath $script:HistoryPath)) {
         Clear-Terminal
         Write-Heading -Text 'Download history - biggest to smallest'
-        Write-Host "No downloads have been recorded by Seen's yt-dlp Downloader yet." -ForegroundColor Yellow
+        Write-Host "No downloads have been recorded by Yt-dlp Downloader yet." -ForegroundColor Yellow
         Pause-Terminal
         return
     }
@@ -2177,94 +2177,18 @@ function Get-InstalledRevision {
     return $null
 }
 
-# Copy staged app files over the live ones with all-or-nothing rollback: each existing
-# file is backed up first, and if any copy fails every file already swapped is restored
-# before the error is rethrown. Uses the same worker as the standalone installer.
-function Install-AppFiles {
-    param([Parameter(Mandatory = $true)][string]$Stage,
-        [Parameter(Mandatory = $true)][string]$Target,
-        [Parameter(Mandatory = $true)][string[]]$Names)
-    Install-SetupFiles $Stage $Target $Names
-}
-
-# Pull the newest app source files from the GitHub repo and swap them in place. Only the
-# app scripts/docs are updated (engine binaries self-update separately). Any network or
-# validation failure leaves every file untouched and returns without throwing, so the
-# engine-update steps that follow this call still run.
-function Update-AppFromGitHub {
-    param([string]$Revision)
-    Write-Host 'Checking GitHub for a newer app version...' -ForegroundColor DarkGray
-
-    # One rate-limited API call to resolve the latest commit; the repo is public so no
-    # token is required, but honor GITHUB_TOKEN when present (e.g. to raise the limit).
-    $headers = @{ 'User-Agent' = 'Seen-Downloader' }
-    if ($env:GITHUB_TOKEN) { $headers['Authorization'] = 'Bearer ' + $env:GITHUB_TOKEN }
-    $sha = $null
-    try {
-        $commitApi = 'https://api.github.com/repos/{0}/commits/{1}' -f $script:RepoOwnerName, $script:RepoBranch
-        $sha = if ($Revision) { $Revision } else { (Invoke-RestMethod -Uri $commitApi -Headers $headers -TimeoutSec 10).sha }
-    } catch {
-        Write-Host ('Could not reach GitHub to check for updates: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
-        Write-Host 'Keeping the current version. You can try again later.' -ForegroundColor DarkGray
-        return $false
-    }
-    if ([string]$sha -notmatch '^[0-9a-f]{40}$') {
-        Write-Host 'GitHub returned an unexpected revision; skipping the app update.' -ForegroundColor Yellow
-        return $false
-    }
-
-    $installed = Get-InstalledRevision
-    if ($installed -eq $sha) {
-        Write-Host ('The app is already up to date (rev {0}).' -f $sha.Substring(0, 7)) -ForegroundColor Green
-        return $false
-    }
-
-    Write-Host ('A newer app version is available (rev {0}). Downloading...' -f $sha.Substring(0, 7)) -ForegroundColor Cyan
-    $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('seen-app-{0}' -f ([guid]::NewGuid().ToString('N')))
-    $updateLock = $null
-    try {
-        $updateLock = [IO.File]::Open((Join-Path $script:Root '.setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
-        New-Item -ItemType Directory -Path $stage -Force | Out-Null
-
-        # Fetch each app file from raw.githubusercontent pinned to the exact commit. This
-        # avoids the GitHub API rate limit for file content and needs no Accept header.
-        foreach ($name in $script:AppFiles) {
-            $encoded = ($name -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
-            $url = 'https://raw.githubusercontent.com/{0}/{1}/{2}' -f $script:RepoOwnerName, $sha, $encoded
-            Write-Host ('  Downloading {0}...' -f $name) -ForegroundColor DarkGray
-            [void](Invoke-ReliableDownload -Url $url -Destination (Join-Path $stage $name))
-        }
-
-        # Refuse to swap in a script that would not parse - guards against a truncated or
-        # corrupted download bricking the app on next launch.
-        $tokens = $null
-        $parseErrors = $null
-        [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $stage 'smart-downloader.ps1'), [ref]$tokens, [ref]$parseErrors)
-        if ($parseErrors.Count) {
-            Write-Host 'The downloaded app failed a syntax check; keeping the current version.' -ForegroundColor Red
-            return $false
-        }
-
-        Set-Content -LiteralPath (Join-Path $stage 'installed-version.txt') -Value $sha -Encoding ASCII
-        Install-AppFiles -Stage $stage -Target $script:Root -Names ($script:AppFiles + @('installed-version.txt'))
-
-        $script:RestartRequested = $true
-        Write-Host ('App updated to rev {0}. Restarting to load the new version...' -f $sha.Substring(0, 7)) -ForegroundColor Green
-        return $true
-    } catch {
-        Write-Host ('App update failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
-        Write-Host 'Update did not complete. Close other setup windows and try again; downloads and settings are preserved.' -ForegroundColor DarkGray
-        return $false
-    } finally {
-        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
-        if ($updateLock) { $updateLock.Dispose() }
-    }
-}
-
 function Update-DownloaderEngine {
     param([string]$Revision)
     Clear-Terminal
     Write-Heading -Text 'Update / repair this app and its helpers'
+    # A git checkout is developer-managed: the installer would overwrite the working tree
+    # (including uncommitted changes) with the stable branch. Refuse and let git drive.
+    if (Test-Path -LiteralPath (Join-Path $script:Root '.git')) {
+        Write-Host 'This is a git checkout, so the in-app updater is disabled to protect your working tree.' -ForegroundColor Yellow
+        Write-Host 'Update this copy with git (for example: git pull) instead.' -ForegroundColor DarkGray
+        Pause-Terminal
+        return
+    }
     if ($script:DownloadQueue.Count -gt 0) {
         $answer = (Read-Host 'Updating restarts the app and clears this session queue. Continue? [y/N]').Trim()
         if ($answer -notin @('y', 'yes')) { return }
@@ -2660,9 +2584,9 @@ function Get-SocialPostPlatforms {
     return @('instagram', 'tiktok', 'x', 'facebook')
 }
 
-# Pinned gallery-dl release. Codeberg publishes no checksum file, so Sha256 is
-# empty by default: Install-GalleryDl then records and fingerprints the binary on
-# first download (trust-on-first-use). Set Sha256 to enforce strict verification.
+# Pinned gallery-dl release. Codeberg publishes no checksum file, so the Sha256 in
+# Get-SetupGalleryRelease is pinned from the run-tested binary and is enforced on every
+# download and on cached-file reuse (see Install-GalleryDl / Copy-SetupCachedGroup).
 function Get-GalleryDlRelease { return (Get-SetupGalleryRelease) }
 
 function Get-GalleryDlVersion {
@@ -3283,6 +3207,17 @@ function Get-AppVersion {
             if ($sha -match '^[0-9a-f]{7,40}$') { $rev = $sha.Substring(0, 7) }
         } catch { }
     }
+    # installed-version.txt is gitignored, so it is absent on a fresh `git clone` and
+    # goes stale when the app is advanced with git instead of the in-app updater. When
+    # it can't supply a revision, fall back to the actual checked-out commit so a
+    # git-managed copy reports its real rev instead of nothing.
+    if (-not $rev) {
+        try {
+            $sha = (& git -C $script:Root rev-parse HEAD 2>$null | Select-Object -First 1)
+            if ($sha) { $sha = $sha.Trim() }
+            if ($sha -match '^[0-9a-f]{7,40}$') { $rev = $sha.Substring(0, 7) }
+        } catch { }
+    }
     if ($friendly -and $rev) { return ('v{0} (rev {1})' -f $friendly, $rev) }
     if ($friendly) { return ('v{0}' -f $friendly) }
     if ($rev) { return ('rev {0}' -f $rev) }
@@ -3302,7 +3237,7 @@ function Invoke-InstallerUpdate {
         if ($Revision -notmatch '^[a-f0-9]{40}$') { throw 'GitHub returned an invalid revision.' }
         New-Item -ItemType Directory -Path $stage | Out-Null
         $installerPath = Join-Path $stage 'installer.cmd'
-        $url = 'https://raw.githubusercontent.com/{0}/{1}/Install%20Seen%20Downloader.cmd' -f $script:RepoOwnerName, $Revision
+        $url = 'https://raw.githubusercontent.com/{0}/{1}/Install%20Yt-dlp%20Downloader.cmd' -f $script:RepoOwnerName, $Revision
         [void](Invoke-ReliableDownload $url $installerPath)
         $parts = [IO.File]::ReadAllText($installerPath) -split '(?m)^# POWERSHELL START\r?$', 2
         if ($parts.Count -ne 2) { throw 'The downloaded installer is incomplete.' }
@@ -3356,8 +3291,9 @@ function Invoke-StartupUpdateCheck {
 function Show-MainMenu {
     Clear-Terminal
     Write-Host '=============================================' -ForegroundColor Cyan
-    Write-Host "          SEEN'S yt-dlp DOWNLOADER" -ForegroundColor White
-    Write-Host ('               {0}' -f (Get-AppVersion)) -ForegroundColor DarkGray
+    Write-Host "              Yt-dlp Downloader" -ForegroundColor White
+    Write-Host ('{0}{1}' -f (' ' * [Math]::Max(0, [int][Math]::Floor((45 - (Get-AppVersion).Length) / 2))), (Get-AppVersion)) -ForegroundColor DarkGray
+    Write-Host '                 by MaybeSeen' -ForegroundColor DarkGray
     Write-Host '=============================================' -ForegroundColor Cyan
     Write-Host '  1. Download a video, audio, live, playlist, or social post'
     Write-Host '  2. Download queue'

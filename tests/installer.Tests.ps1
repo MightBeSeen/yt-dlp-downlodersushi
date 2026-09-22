@@ -1,7 +1,7 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot
-$text = [IO.File]::ReadAllText((Join-Path $root 'Install Seen Downloader.cmd'))
+$text = [IO.File]::ReadAllText((Join-Path $root 'Install Yt-dlp Downloader.cmd'))
 $source = ($text -split '(?m)^# POWERSHELL START\r?$', 2)[1]
 $tokens = $null
 $errors = $null

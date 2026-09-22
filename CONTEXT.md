@@ -2,7 +2,7 @@
 
 ## Runtime and distribution
 
-`Seen's yt-dlp Downloader.cmd` is the launcher. It prefers PowerShell 7, falls back to
+`Yt-dlp Downloader.cmd` is the launcher. It prefers PowerShell 7, falls back to
 Windows PowerShell 5.1, and reloads the app on the reserved update exit code 42.
 
 `smart-downloader.ps1` is the self-contained interactive app. Keeping it self-contained
@@ -19,7 +19,7 @@ runtime module would break upgrades for existing users. Functions are grouped in
 | Settings/accounts | JSON stores under logs, platform-filtered temporary cookie copies, persisted platform holds |
 | Updates | `Invoke-StartupUpdateCheck` → `Update-DownloaderEngine` → `Invoke-InstallerUpdate`; fresh child process runs the checked revision's installer |
 
-`Install Seen Downloader.cmd` has a CMD wrapper and an embedded PowerShell body. It
+`Install Yt-dlp Downloader.cmd` has a CMD wrapper and an embedded PowerShell body. It
 resolves `stable` to a commit, stages the app and all helper binaries, checks hashes
 and executable startup, and installs with rollback on handled copy failures. It also
 creates shortcuts and launches the app for fresh installs. The in-app updater runs

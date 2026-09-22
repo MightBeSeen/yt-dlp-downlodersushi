@@ -6,17 +6,17 @@ A Windows menu app for downloading video, audio, playlists, livestreams, and sup
 
 ## Install
 
-1. **[Download Install Seen Downloader.cmd](https://github.com/MightBeSeen/yt-dlp-downlodersushi/raw/refs/heads/stable/Install%20Seen%20Downloader.cmd)** and save it to your PC.
+1. **[Download Install Yt-dlp Downloader.cmd](https://github.com/MightBeSeen/yt-dlp-downlodersushi/raw/refs/heads/stable/Install%20Yt-dlp%20Downloader.cmd)** and save it to your PC.
 2. Double-click it. Setup downloads the app and its helpers, creates shortcuts, and opens the app.
 3. Paste a link and follow the menu. Files are saved in the app's `Downloads` folder.
 
 Requires an internet connection and Windows 10/11 on an Intel/AMD 64-bit PC.
 No administrator access, Python, Node.js, winget, or PowerShell 7 installation is needed.
-The app installs in `%LOCALAPPDATA%\Seen Downloader`.
+The app installs in `%LOCALAPPDATA%\Yt-dlp Downloader`.
 
 Setup shows downloaded MB, verifies the helper files, and tries an alternate FFmpeg
 source when necessary. If it cannot finish, rerun the installer. Details are saved
-in `%LOCALAPPDATA%\Seen Downloader\logs\setup-*.log`.
+in `%LOCALAPPDATA%\Yt-dlp Downloader\logs\setup-*.log`.
 
 ## Updates
 

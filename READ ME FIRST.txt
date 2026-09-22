@@ -1,13 +1,13 @@
 ========================================
-  SEEN'S yt-dlp DOWNLOADER  -  READ ME FIRST
+  Yt-dlp Downloader  -  READ ME FIRST
 ========================================
 
 HOW TO RUN
 ----------
-NEW PC: double-click "Install Seen Downloader.cmd". Setup downloads the latest
+NEW PC: double-click "Install Yt-dlp Downloader.cmd". Setup downloads the latest
 app and all helpers, adds shortcuts, and opens the downloader. No admin needed.
 Requires internet and Windows 10/11 on an Intel/AMD 64-bit PC.
-Installed location: %LOCALAPPDATA%\Seen Downloader
+Installed location: %LOCALAPPDATA%\Yt-dlp Downloader
 Close the downloader and rerun the installer to update. Your data is kept.
 The app also checks for updates when opened. Choose Update now or Later.
 Menu option 5 updates/repairs the app and all download helpers together.
@@ -17,11 +17,11 @@ Setup shows downloaded MB while working. FFmpeg is the largest download;
 the "Step 3/6 complete" line does not mean its download is stuck at 50%.
 If a connection stalls, setup retries or switches the FFmpeg download source.
 If setup cannot finish, rerun it later. Error details are saved in:
-  %LOCALAPPDATA%\Seen Downloader\logs\setup-*.log
+  %LOCALAPPDATA%\Yt-dlp Downloader\logs\setup-*.log
 
 ALREADY HAVE A PORTABLE COPY:
 1. Keep ALL the files in this folder together (don't move just one out).
-2. Double-click:  Seen's yt-dlp Downloader.cmd
+2. Double-click:  Yt-dlp Downloader.cmd
 3. Follow the on-screen menu. Review your choices and destination before starting.
    Choose "Change choices" to edit them, or cancel without starting a download.
    Arrow keys and Enter select options; small terminals use numbered prompts.
