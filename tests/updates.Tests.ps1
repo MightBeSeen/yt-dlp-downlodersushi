@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
 $script:Root = $sandbox
 $script:RepoOwnerName = 'example/repo'
 $script:RepoBranch = 'main'
-$script:AppFiles = @('smart-downloader.ps1', "Seen's yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt')
+$script:AppFiles = @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt')
 $script:nextRevision = 'b' * 40
 function Invoke-RestMethod { param($Uri, $Headers, $TimeoutSec) [pscustomobject]@{ sha = $script:nextRevision } }
 function Invoke-ReliableDownload {

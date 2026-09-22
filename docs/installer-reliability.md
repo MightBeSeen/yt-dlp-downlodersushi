@@ -46,7 +46,7 @@ This records the initial installer fix. The subsequent [project audit](project-a
 adds a shared update core, tested stable channel, helper reuse, and a pinned gallery-dl
 SHA256; the original gallery-dl verification limitation below has therefore been addressed.
 
-`Install Seen Downloader.cmd` remains a standalone double-click installer using
+`Install Yt-dlp Downloader.cmd` remains a standalone double-click installer using
 Windows' built-in PowerShell/.NET. Downloads report activity every two seconds,
 abort after 45 seconds without data, and allow up to 30 minutes per attempt. Generic
 downloads retry three times; FFmpeg tries each publisher host once. Integrity checks

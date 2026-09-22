@@ -1,4 +1,4 @@
-# Seen Downloader: Local Multi-Platform Expansion
+# Yt-dlp Downloader: Local Multi-Platform Expansion
 
 **Status:** Implementation plan, revised after self-review. No implementation is included in this document.
 **Research date:** 2026-09-21

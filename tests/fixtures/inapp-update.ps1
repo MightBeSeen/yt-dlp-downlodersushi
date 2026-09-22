@@ -13,8 +13,8 @@ function Clear-Terminal {}
 function Pause-Terminal { throw 'Unexpected error/pause during successful in-app update' }
 function Invoke-ReliableDownload {
     param($Url, $Destination)
-    if ($Url -notmatch '/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/Install%20Seen%20Downloader.cmd$') { throw "Installer revision was not pinned: $Url" }
-    $text = [IO.File]::ReadAllText((Join-Path $env:SEEN_TEST_SOURCE 'Install Seen Downloader.cmd'))
+    if ($Url -notmatch '/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/Install%20Yt-dlp%20Downloader.cmd$') { throw "Installer revision was not pinned: $Url" }
+    $text = [IO.File]::ReadAllText((Join-Path $env:SEEN_TEST_SOURCE 'Install Yt-dlp Downloader.cmd'))
     $text = $text.Replace('# --- Main flow', '. (Join-Path $env:SEEN_TEST_SOURCE "tests\fixtures\installer-downloads.ps1")' + "`r`n# --- Main flow")
     [IO.File]::WriteAllText($Destination, $text)
     return $true

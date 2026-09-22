@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot
 $core = [IO.File]::ReadAllText((Join-Path $root 'lib\update-core.ps1')).Replace("`r`n", "`n").TrimEnd()
 $block = "# BEGIN GENERATED UPDATE CORE - edit lib/update-core.ps1, then run scripts/Sync-UpdateCore.ps1`n$core`n# END GENERATED UPDATE CORE"
-foreach ($name in @('smart-downloader.ps1', 'Install Seen Downloader.cmd')) {
+foreach ($name in @('smart-downloader.ps1', 'Install Yt-dlp Downloader.cmd')) {
     $path = Join-Path $root $name
     $source = [IO.File]::ReadAllText($path).Replace("`r`n", "`n")
     $pattern = '(?ms)^# BEGIN GENERATED UPDATE CORE[^\n]*\n.*?^# END GENERATED UPDATE CORE'
@@ -16,4 +16,11 @@ foreach ($name in @('smart-downloader.ps1', 'Install Seen Downloader.cmd')) {
         [IO.File]::WriteAllText($path, $updated.Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
     }
 }
-Write-Host 'Shared update core is synchronized.'
+$primary = Join-Path $root 'Install Yt-dlp Downloader.cmd'
+$legacy = Join-Path $root 'Install Seen Downloader.cmd'
+if ($Check) {
+    if ([IO.File]::ReadAllText($primary) -cne [IO.File]::ReadAllText($legacy)) { throw 'Legacy installer is stale. Run scripts/Sync-UpdateCore.ps1.' }
+} else {
+    Copy-Item -LiteralPath $primary -Destination $legacy -Force
+}
+Write-Host 'Shared update core and compatibility installer are synchronized.'

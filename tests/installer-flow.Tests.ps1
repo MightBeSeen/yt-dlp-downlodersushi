@@ -20,7 +20,7 @@ try {
     foreach ($name in @('ffmpeg.exe','ffprobe.exe')) { Copy-Item (Join-Path $sandbox 'engine.bin') (Join-Path $ffRoot $name) }
     Set-Content (Join-Path $ffRoot 'LICENSE') 'fixture license'
     Compress-Archive -LiteralPath $ffRoot -DestinationPath (Join-Path $sandbox 'ffmpeg.zip')
-    $body = ([IO.File]::ReadAllText((Join-Path $root 'Install Seen Downloader.cmd')) -split '(?m)^# POWERSHELL START\r?$',2)[1]
+    $body = ([IO.File]::ReadAllText((Join-Path $root 'Install Yt-dlp Downloader.cmd')) -split '(?m)^# POWERSHELL START\r?$',2)[1]
     $body = $body.Replace('# --- Main flow', '. (Join-Path $env:SEEN_TEST_SOURCE "tests\fixtures\installer-downloads.ps1")' + "`r`n# --- Main flow")
     $runner = Join-Path $sandbox 'setup.ps1'
     [IO.File]::WriteAllText($runner, $body, (New-Object Text.UTF8Encoding($true)))
@@ -28,7 +28,7 @@ try {
     $engine = (Get-Process -Id $PID).Path
     & $engine -NoProfile -ExecutionPolicy Bypass -File $runner -InstallDir $target -NoLaunch -NoShortcuts *> (Join-Path $sandbox 'first.log')
     Assert ($LASTEXITCODE -eq 0) 'complete standalone installer succeeds from an empty folder'
-    foreach ($file in @('smart-downloader.ps1', "Seen's yt-dlp Downloader.cmd", 'Install Seen Downloader.cmd', 'installed-version.txt', 'installed-helpers.json','yt-dlp.exe','node.exe','ffmpeg.exe','ffprobe.exe','gallery-dl.exe')) {
+    foreach ($file in @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'Install Yt-dlp Downloader.cmd', "Seen's yt-dlp Downloader.cmd", 'Install Seen Downloader.cmd', 'installed-version.txt', 'installed-helpers.json','yt-dlp.exe','node.exe','ffmpeg.exe','ffprobe.exe','gallery-dl.exe')) {
         Assert (Test-Path -LiteralPath (Join-Path $target $file)) "installs $file"
     }
     Assert (@(Get-Content (Join-Path $sandbox 'probes.txt')).Count -eq 5) 'all five helper checks run before installation'
@@ -65,8 +65,11 @@ if ($count -eq 0) { exit 42 }
 exit 0
 '@
     Set-Content (Join-Path $target 'smart-downloader.ps1') $stub
-    & (Join-Path $target "Seen's yt-dlp Downloader.cmd") *> (Join-Path $sandbox 'restart.log')
+    & (Join-Path $target "Yt-dlp Downloader.cmd") *> (Join-Path $sandbox 'restart.log')
     Assert ($LASTEXITCODE -eq 0 -and (Get-Content (Join-Path $target 'starts.txt')) -eq '2') 'launcher reloads the new app exactly once after an update'
+    Remove-Item -LiteralPath (Join-Path $target 'starts.txt')
+    & (Join-Path $target "Seen's yt-dlp Downloader.cmd") *> (Join-Path $sandbox 'legacy-restart.log')
+    Assert ($LASTEXITCODE -eq 0 -and (Get-Content (Join-Path $target 'starts.txt')) -eq '2') 'legacy launcher still restarts successfully'
 } finally {
     Remove-Item Env:\SEEN_TEST_SOURCE,Env:\SEEN_TEST_FIXTURES,Env:\SEEN_TEST_FAIL_HELPER -ErrorAction SilentlyContinue
     if ((Split-Path -Parent $sandbox) -eq [IO.Path]::GetFullPath((Join-Path $root '.test-temp')) -and (Split-Path -Leaf $sandbox) -match '^installer-flow-[a-f0-9]{32}$') {

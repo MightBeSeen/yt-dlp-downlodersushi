@@ -16,7 +16,7 @@ $script:GalleryDl = Join-Path $script:Root 'gallery-dl.exe'
 # which have their own update paths). Kept in sync with the network installer's list.
 $script:RepoOwnerName = 'MightBeSeen/yt-dlp-downlodersushi'
 $script:RepoBranch    = 'stable'
-$script:AppFiles      = @('smart-downloader.ps1', "Seen's yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt', 'Install Seen Downloader.cmd')
+$script:AppFiles      = @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt', 'Install Yt-dlp Downloader.cmd', "Seen's yt-dlp Downloader.cmd", 'Install Seen Downloader.cmd')
 $script:RestartRequested = $false
 
 # Make helpers that live beside the script (e.g. a downloaded ffmpeg.exe) discoverable to
@@ -335,7 +335,7 @@ $script:MediaExtensions = @(
 try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $OutputEncoding = [Console]::OutputEncoding
-    $Host.UI.RawUI.WindowTitle = "Seen's yt-dlp Downloader"
+    $Host.UI.RawUI.WindowTitle = "Yt-dlp Downloader"
 } catch {
     # Some redirected/non-interactive hosts do not expose console settings.
 }
@@ -2085,7 +2085,7 @@ function Show-DownloadHistory {
     if (-not (Test-Path -LiteralPath $script:HistoryPath)) {
         Clear-Terminal
         Write-Heading -Text 'Download history - biggest to smallest'
-        Write-Host "No downloads have been recorded by Seen's yt-dlp Downloader yet." -ForegroundColor Yellow
+        Write-Host "No downloads have been recorded by Yt-dlp Downloader yet." -ForegroundColor Yellow
         Pause-Terminal
         return
     }
@@ -3302,7 +3302,7 @@ function Invoke-InstallerUpdate {
         if ($Revision -notmatch '^[a-f0-9]{40}$') { throw 'GitHub returned an invalid revision.' }
         New-Item -ItemType Directory -Path $stage | Out-Null
         $installerPath = Join-Path $stage 'installer.cmd'
-        $url = 'https://raw.githubusercontent.com/{0}/{1}/Install%20Seen%20Downloader.cmd' -f $script:RepoOwnerName, $Revision
+        $url = 'https://raw.githubusercontent.com/{0}/{1}/Install%20Yt-dlp%20Downloader.cmd' -f $script:RepoOwnerName, $Revision
         [void](Invoke-ReliableDownload $url $installerPath)
         $parts = [IO.File]::ReadAllText($installerPath) -split '(?m)^# POWERSHELL START\r?$', 2
         if ($parts.Count -ne 2) { throw 'The downloaded installer is incomplete.' }
@@ -3356,8 +3356,9 @@ function Invoke-StartupUpdateCheck {
 function Show-MainMenu {
     Clear-Terminal
     Write-Host '=============================================' -ForegroundColor Cyan
-    Write-Host "          SEEN'S yt-dlp DOWNLOADER" -ForegroundColor White
-    Write-Host ('               {0}' -f (Get-AppVersion)) -ForegroundColor DarkGray
+    Write-Host "              Yt-dlp Downloader" -ForegroundColor White
+    Write-Host ('{0}{1}' -f (' ' * [Math]::Max(0, [int][Math]::Floor((45 - (Get-AppVersion).Length) / 2))), (Get-AppVersion)) -ForegroundColor DarkGray
+    Write-Host '                 by MaybeSeen' -ForegroundColor DarkGray
     Write-Host '=============================================' -ForegroundColor Cyan
     Write-Host '  1. Download a video, audio, live, playlist, or social post'
     Write-Host '  2. Download queue'
