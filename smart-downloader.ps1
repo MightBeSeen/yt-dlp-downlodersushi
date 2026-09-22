@@ -16,7 +16,7 @@ $script:GalleryDl = Join-Path $script:Root 'gallery-dl.exe'
 # which have their own update paths). Kept in sync with the network installer's list.
 $script:RepoOwnerName = 'MightBeSeen/yt-dlp-downlodersushi'
 $script:RepoBranch    = 'stable'
-$script:AppFiles      = @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt', 'Install Yt-dlp Downloader.cmd', "Seen's yt-dlp Downloader.cmd", 'Install Seen Downloader.cmd')
+$script:AppFiles      = @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt', 'Install Yt-dlp Downloader.cmd')
 $script:RestartRequested = $false
 
 # Make helpers that live beside the script (e.g. a downloaded ffmpeg.exe) discoverable to

@@ -28,7 +28,7 @@ try {
     $engine = (Get-Process -Id $PID).Path
     & $engine -NoProfile -ExecutionPolicy Bypass -File $runner -InstallDir $target -NoLaunch -NoShortcuts *> (Join-Path $sandbox 'first.log')
     Assert ($LASTEXITCODE -eq 0) 'complete standalone installer succeeds from an empty folder'
-    foreach ($file in @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'Install Yt-dlp Downloader.cmd', "Seen's yt-dlp Downloader.cmd", 'Install Seen Downloader.cmd', 'installed-version.txt', 'installed-helpers.json','yt-dlp.exe','node.exe','ffmpeg.exe','ffprobe.exe','gallery-dl.exe')) {
+    foreach ($file in @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'Install Yt-dlp Downloader.cmd', 'installed-version.txt', 'installed-helpers.json','yt-dlp.exe','node.exe','ffmpeg.exe','ffprobe.exe','gallery-dl.exe')) {
         Assert (Test-Path -LiteralPath (Join-Path $target $file)) "installs $file"
     }
     Assert (@(Get-Content (Join-Path $sandbox 'probes.txt')).Count -eq 5) 'all five helper checks run before installation'
@@ -67,9 +67,6 @@ exit 0
     Set-Content (Join-Path $target 'smart-downloader.ps1') $stub
     & (Join-Path $target "Yt-dlp Downloader.cmd") *> (Join-Path $sandbox 'restart.log')
     Assert ($LASTEXITCODE -eq 0 -and (Get-Content (Join-Path $target 'starts.txt')) -eq '2') 'launcher reloads the new app exactly once after an update'
-    Remove-Item -LiteralPath (Join-Path $target 'starts.txt')
-    & (Join-Path $target "Seen's yt-dlp Downloader.cmd") *> (Join-Path $sandbox 'legacy-restart.log')
-    Assert ($LASTEXITCODE -eq 0 -and (Get-Content (Join-Path $target 'starts.txt')) -eq '2') 'legacy launcher still restarts successfully'
 } finally {
     Remove-Item Env:\SEEN_TEST_SOURCE,Env:\SEEN_TEST_FIXTURES,Env:\SEEN_TEST_FAIL_HELPER -ErrorAction SilentlyContinue
     if ((Split-Path -Parent $sandbox) -eq [IO.Path]::GetFullPath((Join-Path $root '.test-temp')) -and (Split-Path -Leaf $sandbox) -match '^installer-flow-[a-f0-9]{32}$') {

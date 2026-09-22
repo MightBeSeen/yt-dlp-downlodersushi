@@ -1,4 +1,4 @@
-# Seen's yt-dlp Downloader
+# Yt-dlp Downloader
 
 A Windows menu app for downloading video, audio, playlists, livestreams, and supported social posts.
 
