@@ -16,11 +16,4 @@ foreach ($name in @('smart-downloader.ps1', 'Install Yt-dlp Downloader.cmd')) {
         [IO.File]::WriteAllText($path, $updated.Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
     }
 }
-$primary = Join-Path $root 'Install Yt-dlp Downloader.cmd'
-$legacy = Join-Path $root 'Install Seen Downloader.cmd'
-if ($Check) {
-    if ([IO.File]::ReadAllText($primary) -cne [IO.File]::ReadAllText($legacy)) { throw 'Legacy installer is stale. Run scripts/Sync-UpdateCore.ps1.' }
-} else {
-    Copy-Item -LiteralPath $primary -Destination $legacy -Force
-}
-Write-Host 'Shared update core and compatibility installer are synchronized.'
+Write-Host 'Shared update core is synchronized.'

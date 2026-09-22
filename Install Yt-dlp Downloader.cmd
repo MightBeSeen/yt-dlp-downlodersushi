@@ -392,7 +392,7 @@ try {
     $commit = (Get-Content -LiteralPath (Join-Path $stage 'commit.json') -Raw | ConvertFrom-Json).sha
     } else { $commit = $AppRevision }
     if ($commit -notmatch '^[a-f0-9]{40}$') { throw 'GitHub returned an invalid revision.' }
-    $appFiles = @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt', 'Install Yt-dlp Downloader.cmd', "Seen's yt-dlp Downloader.cmd", 'Install Seen Downloader.cmd')
+    $appFiles = @('smart-downloader.ps1', "Yt-dlp Downloader.cmd", 'README.md', 'READ ME FIRST.txt', 'Install Yt-dlp Downloader.cmd')
     $helperRecords = [ordered]@{}
     foreach ($name in $appFiles) {
         $encoded = ($name -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'

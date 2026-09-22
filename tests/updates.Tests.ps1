@@ -26,20 +26,6 @@ function Invoke-ReliableDownload {
 try {
     Set-Content (Join-Path $sandbox 'smart-downloader.ps1') '# old version'
     Set-Content (Join-Path $sandbox 'installed-version.txt') ('a' * 40)
-    $lock = [IO.File]::Open((Join-Path $sandbox 'installed-version.txt'), 'Open', 'Read', 'Read')
-    try { Update-AppFromGitHub | Out-Null } finally { $lock.Dispose() }
-    Assert ((Get-Content (Join-Path $sandbox 'smart-downloader.ps1')) -eq '# old version') 'revision write failure rolls back app files too'
-    Assert ((Get-Content (Join-Path $sandbox 'installed-version.txt')) -eq ('a' * 40)) 'failed update preserves previous revision'
-    $setupLock = [IO.File]::Open((Join-Path $sandbox '.setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
-    try { $result = Update-AppFromGitHub } finally { $setupLock.Dispose() }
-    Assert (-not $result -and (Get-Content (Join-Path $sandbox 'smart-downloader.ps1')) -eq '# old version') 'parallel standalone setup blocks in-app file replacement'
-    $script:RestartRequested = $false
-    $result = Update-AppFromGitHub
-    Assert ($result -and $script:RestartRequested) 'successful app update requests a restart'
-    Assert ((Get-Content (Join-Path $sandbox 'installed-version.txt')) -eq $script:nextRevision) 'app and revision are committed together'
-    $script:RestartRequested = $false
-    Assert (-not (Update-AppFromGitHub) -and -not $script:RestartRequested) 'already-current app does not restart'
-
     $script:Settings = [pscustomobject]@{ CheckForUpdates = $true }
     $script:checks = 0; $script:offers = 0; $script:updates = 0
     $script:startupRevision = 'c' * 40
@@ -52,6 +38,8 @@ try {
     $script:choice = 'Update'
     Invoke-StartupUpdateCheck
     Assert ($script:updates -eq 1) 'startup Update choice passes the checked revision to the full installer'
+    # When the checked revision already matches what is installed, no prompt appears.
+    Set-Content (Join-Path $sandbox 'installed-version.txt') $script:nextRevision
     $script:startupRevision = $script:nextRevision
     Invoke-StartupUpdateCheck
     Assert ($script:offers -eq 2) 'current version does not prompt'

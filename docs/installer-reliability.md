@@ -50,8 +50,9 @@ SHA256; the original gallery-dl verification limitation below has therefore been
 Windows' built-in PowerShell/.NET. Downloads report activity every two seconds,
 abort after 45 seconds without data, and allow up to 30 minutes per attempt. Generic
 downloads retry three times; FFmpeg tries each publisher host once. Integrity checks
-remain mandatory for yt-dlp, Node.js, and FFmpeg. gallery-dl retains the existing
-pinned version and executable smoke check; it has no published checksum in this flow.
+remain mandatory for yt-dlp, Node.js, FFmpeg, and gallery-dl. gallery-dl has no
+Codeberg-published checksum file, so it is verified against a version-pinned SHA256 in
+`lib/update-core.ps1` in addition to the executable smoke check.
 
 Installation still stages all files and checks every helper before replacing the
 existing app. Copy failures roll back; existing downloads and settings are preserved.
